@@ -531,54 +531,78 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	nodesCount := 0
 	edgesCount := 0
 
-	// 3. Write all entries to database in a single transaction
-	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
-		// Insert nodes & vectors
-		for i, ent := range parsedEntities {
-			err = gdb.AddNode(tx, ent.ID, ent.Type, ent.Name, ent.FQN, ent.Code, ent.Docstring, projectID, nil)
-			if err != nil {
-				return fmt.Errorf("failed to save node: %w", err)
-			}
-			nodesCount++
+	// 3. Write all entries to database in batch transactions to avoid memory blowout
+	batchSize := 1000
 
-			emb := embeddings[i]
-			if len(emb) > 0 {
-				embBytes := vector.Float32SliceToBytes(emb)
-				err = gdb.SaveVector(tx, ent.ID, embBytes, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
+	// Insert nodes & vectors in batches
+	for batchStart := 0; batchStart < len(parsedEntities); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(parsedEntities) {
+			batchEnd = len(parsedEntities)
+		}
+		batchEntities := parsedEntities[batchStart:batchEnd]
+
+		err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+			for i, ent := range batchEntities {
+				globalIndex := batchStart + i
+				err = gdb.AddNode(tx, ent.ID, ent.Type, ent.Name, ent.FQN, ent.Code, ent.Docstring, projectID, nil)
 				if err != nil {
-					return fmt.Errorf("failed to save vector: %w", err)
+					return fmt.Errorf("failed to save node: %w", err)
 				}
-				vStore.AddVector(ent.ID, emb, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
-			}
-		}
+				nodesCount++
 
-		// Keep track of newly inserted node IDs to bypass placeholder generation in edges insertion
-		insertedNodeIDs := make(map[string]bool)
-		for _, ent := range parsedEntities {
-			insertedNodeIDs[ent.ID] = true
-		}
-
-		// Insert edges
-		for _, rel := range parsedRelations {
-			var err error
-			if insertedNodeIDs[rel.Source] && insertedNodeIDs[rel.Target] {
-				// Fast path: both nodes exist, execute direct insert
-				query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, '{}');`
-				_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label)
-			} else {
-				// Fallback path: one of the nodes might be external
-				err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, nil)
+				emb := embeddings[globalIndex]
+				if len(emb) > 0 {
+					embBytes := vector.Float32SliceToBytes(emb)
+					err = gdb.SaveVector(tx, ent.ID, embBytes, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
+					if err != nil {
+						return fmt.Errorf("failed to save vector: %w", err)
+					}
+					vStore.AddVector(ent.ID, emb, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
+				}
 			}
-			if err != nil {
-				return fmt.Errorf("failed to save edge: %w", err)
-			}
-			edgesCount++
+			return nil
+		})
+		if err != nil {
+			return 0, 0, 0, err
 		}
-		return nil
-	})
+	}
 
-	if err != nil {
-		return 0, 0, 0, err
+	// Keep track of newly inserted node IDs to bypass placeholder generation in edges insertion
+	insertedNodeIDs := make(map[string]bool)
+	for _, ent := range parsedEntities {
+		insertedNodeIDs[ent.ID] = true
+	}
+
+	// Insert edges in batches
+	for batchStart := 0; batchStart < len(parsedRelations); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(parsedRelations) {
+			batchEnd = len(parsedRelations)
+		}
+		batchRelations := parsedRelations[batchStart:batchEnd]
+
+		err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+			for _, rel := range batchRelations {
+				var err error
+				if insertedNodeIDs[rel.Source] && insertedNodeIDs[rel.Target] {
+					// Fast path: both nodes exist, execute direct insert
+					query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, '{}');`
+					_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label)
+				} else {
+					// Fallback path: one of the nodes might be external
+					err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, nil)
+				}
+				if err != nil {
+					return fmt.Errorf("failed to save edge: %w", err)
+				}
+				edgesCount++
+			}
+			return nil
+		})
+		if err != nil {
+			return 0, 0, 0, err
+		}
 	}
 
 	return len(allFiles), nodesCount, edgesCount, nil
