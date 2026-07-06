@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -155,6 +156,29 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 				},
 			},
 			{
+				Name:        "m_cpg_find_duplicates",
+				Description: "Checks if a proposed code snippet or functional description matches existing methods/files in the codebase to prevent semantic duplication.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"code_snippet": map[string]string{
+							"type":        "string",
+							"description": "The function signature, code implementation, or design description planned to be written.",
+						},
+						"threshold": map[string]interface{}{
+							"type":        "number",
+							"description": "Cosine similarity threshold (default 0.70). Values above this are flagged as potential duplicates.",
+							"default":     0.70,
+						},
+					},
+					Required: []string{"code_snippet"},
+				},
+			},
+			{
 				Name:        "m_cpg_get_file_structure",
 				Description: "Retrieves the structural hierarchy (classes, methods, modules) of a specific file from the code graph database.",
 				InputSchema: struct {
@@ -288,6 +312,28 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 
 		return &mcpToolCallResult{
 			Content: []mcpContent{{Type: "text", Text: contextText}},
+		}, nil
+
+	case "m_cpg_find_duplicates":
+		var params struct {
+			CodeSnippet string  `json:"code_snippet"`
+			Threshold   float32 `json:"threshold"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+		if params.Threshold <= 0 {
+			params.Threshold = 0.70
+		}
+
+		res, err := RunFindDuplicates(params.CodeSnippet, params.Threshold, gdb, vStore, cfg)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to check duplicate: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
 		}, nil
 
 	case "m_cpg_get_file_structure":
@@ -658,6 +704,111 @@ func RunGetPreferences(gdb *db.GraphDB) (string, error) {
 		}
 		sb.WriteString("--------------------------------------------------\n")
 	}
+
+	return sb.String(), nil
+}
+
+// RunFindDuplicates compares proposed code snippet against existing database nodes to flag semantic duplication.
+func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config) (string, error) {
+	// 1. Try to extract a function/method/class name from the snippet for a strict name check
+	var exactMatches []string
+	nameRegexes := []*regexp.Regexp{
+		regexp.MustCompile(`(?:def|func)\s+([a-zA-Z0-9_]+)`),
+		regexp.MustCompile(`class\s+([a-zA-Z0-9_]+)`),
+		regexp.MustCompile(`type\s+([a-zA-Z0-9_]+)\s+(?:struct|interface)`),
+	}
+
+	extractedName := ""
+	for _, re := range nameRegexes {
+		if matches := re.FindStringSubmatch(codeSnippet); len(matches) > 1 {
+			extractedName = matches[1]
+			break
+		}
+	}
+
+	if extractedName != "" {
+		// Query SQLite for exact name match in classes/methods
+		nodes, err := gdb.QueryNodes("", "", "")
+		if err == nil {
+			for _, node := range nodes {
+				name := node["name"].(string)
+				nodeType := node["type"].(string)
+				fqn := node["fqn"].(string)
+				if strings.EqualFold(name, extractedName) {
+					exactMatches = append(exactMatches, fmt.Sprintf("- [Exact Name Match] [%s] %s (Matches proposed name: '%s')\n", nodeType, fqn, extractedName))
+				}
+			}
+		}
+	}
+
+	// 2. Get embedding for the proposed code snippet
+	emb, err := vector.GetEmbedding(
+		codeSnippet,
+		cfg.Embedding.Provider,
+		cfg.Embedding.Model,
+		cfg.Embedding.Endpoint,
+		cfg.Embedding.APIKey,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to embed code snippet: %w", err)
+	}
+
+	// 3. Query VectorStore for matching IDs (Top-5)
+	results := vStore.Search(emb, 5)
+
+	var duplicates []string
+	for _, res := range results {
+		if res.Score >= threshold {
+			node, err := gdb.GetNode(res.ID)
+			if err != nil || node == nil {
+				continue
+			}
+
+			nodeType := node["type"].(string)
+			fqn := node["fqn"].(string)
+			docstring := node["docstring"].(string)
+
+			// Skip if it's already in exact matches to avoid spam
+			isClash := false
+			if extractedName != "" && strings.EqualFold(node["name"].(string), extractedName) {
+				isClash = true
+			}
+
+			if !isClash {
+				var dsb strings.Builder
+				dsb.WriteString(fmt.Sprintf("- [Semantic Match] [%s] %s (Similarity Score: %.4f)\n", nodeType, fqn, res.Score))
+				if docstring != "" {
+					firstLine := strings.Split(docstring, "\n")[0]
+					if len(firstLine) > 80 {
+						firstLine = firstLine[:80] + "..."
+					}
+					dsb.WriteString(fmt.Sprintf("  Docstring: %s\n", firstLine))
+				}
+				duplicates = append(duplicates, dsb.String())
+			}
+		}
+	}
+
+	if len(duplicates) == 0 && len(exactMatches) == 0 {
+		return "Great news! No semantic duplicates or similar files/methods were found in the codebase matching your proposed snippet.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("⚠️ WARNING: Potential Semantic Duplication Found!\n")
+	sb.WriteString("==================================================\n")
+	sb.WriteString("Before creating a new file or method, please examine if you can reuse, extend, or refactor the following existing elements:\n\n")
+	
+	for _, clash := range exactMatches {
+		sb.WriteString(clash)
+		sb.WriteString("\n")
+	}
+
+	for _, d := range duplicates {
+		sb.WriteString(d)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("--------------------------------------------------\n")
+	sb.WriteString("Recommendation: Follow DRY principles. Extend the existing method or class instead of copy-pasting or creating greenfield files.")
 
 	return sb.String(), nil
 }

@@ -1,0 +1,18 @@
+# m-cpg-go AI Coding Rules & Architecture Guidelines
+
+As an AI assistant working on this codebase, you must follow the principles of code simplicity, DRY (Don't Repeat Yourself), and active refactoring. 
+
+## 1. Prevent the "Refactoring Paradox" & Duplicate Code
+Before writing any new function, method, class, struct, or utility helper:
+- **Rule 1**: You MUST call the MCP tool `m_cpg_find_duplicates` first.
+  - Set `code_snippet` to the planned method signature or a descriptive layout of the logic you intend to write.
+  - Set `threshold` to `0.70` (default).
+- **Rule 2**: If the tool returns potential duplicate warnings (either Exact Name Matches or high Semantic similarity scores):
+  - Do NOT create a new function or new file.
+  - You must reuse, import, or extend the existing method/file.
+  - If you need minor behavioral changes, refactor the existing code (e.g. by adding parameters, options, or using polymorphism) instead of duplicating the logic.
+
+## 2. General Development Rules
+1. **Zero CGO Dependencies**: Keep the Go implementation CGO-free. Use pure Go drivers (such as `modernc.org/sqlite` instead of CGO SQLite).
+2. **Robust Error Handling**: Always return errors explicitly instead of panicking or neglecting them. All external API requests must have deterministic fallbacks.
+3. **Local First**: Keep all vector math and database persistence local to the machine workspace (SQLite + local float BLOB storage).
