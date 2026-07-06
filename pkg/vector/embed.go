@@ -7,9 +7,9 @@ import (
 	"hash/fnv"
 	"io"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 )
 
@@ -82,30 +82,20 @@ func GeneratePseudoEmbedding(text string) []float32 {
 	dims := 768
 	vec := make([]float32, dims)
 
-	// Clean and split text into words
-	words := strings.Fields(strings.ToLower(text))
-	if len(words) == 0 {
-		words = []string{"empty"}
-	}
+	h := fnv.New64a()
+	h.Write([]byte(text))
+	seed := int64(h.Sum64())
+	rng := rand.New(rand.NewSource(seed))
 
-	// For each dimension, calculate a deterministic value based on the text hash
+	var sumSquares float32
 	for d := 0; d < dims; d++ {
-		var val float64
-		for i, word := range words {
-			h := fnv.New32a()
-			h.Write([]byte(fmt.Sprintf("%s_%d_%d", word, d, i)))
-			// Map hash value to range [-1, 1]
-			hashVal := float64(h.Sum32()) / float64(math.MaxUint32)
-			val += math.Sin(hashVal * 2.0 * math.Pi)
-		}
-		vec[d] = float32(val / math.Sqrt(float64(len(words))))
+		// Map rand.Float32() [0.0, 1.0) to [-1.0, 1.0)
+		val := rng.Float32()*2.0 - 1.0
+		vec[d] = val
+		sumSquares += val * val
 	}
 
 	// Normalize the pseudo-embedding vector to unit length
-	var sumSquares float32
-	for _, v := range vec {
-		sumSquares += v * v
-	}
 	norm := float32(math.Sqrt(float64(sumSquares)))
 	if norm > 0 {
 		for i := range vec {

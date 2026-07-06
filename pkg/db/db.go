@@ -76,6 +76,7 @@ func InitDB(dbPath string) (*GraphDB, error) {
 func (g *GraphDB) ensureSchema() error {
 	// Enable WAL mode and other optimizations for concurrency and performance
 	pragmas := []string{
+		"PRAGMA foreign_keys=ON;",
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA temp_store=MEMORY;",
