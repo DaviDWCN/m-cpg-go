@@ -1,8 +1,8 @@
 package vector
 
 import (
+	"container/heap"
 	"math"
-	"sort"
 	"sync"
 	"unsafe"
 )
@@ -71,34 +71,71 @@ func (s *VectorStore) RemoveVector(id string) {
 	delete(s.index, id)
 }
 
+// minHeap implements heap.Interface for SearchResult
+type minHeap []SearchResult
+
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return h[i].Score < h[j].Score } // Min-heap: smallest score at root
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *minHeap) Push(x interface{}) {
+	*h = append(*h, x.(SearchResult))
+}
+
+func (h *minHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 // Search retrieves the top K matching vectors using cosine similarity
 func (s *VectorStore) Search(queryVec []float32, limit int) []SearchResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if len(queryVec) == 0 || len(s.nodes) == 0 {
+	if len(queryVec) == 0 || len(s.nodes) == 0 || limit <= 0 {
 		return nil
 	}
 
-	results := make([]SearchResult, 0, len(s.nodes))
+	// Pre-calculate query norm
+	var normQ float32
+	for _, val := range queryVec {
+		normQ += val * val
+	}
+	normQ = float32(math.Sqrt(float64(normQ)))
+
+	h := &minHeap{}
+	heap.Init(h)
+
 	for _, node := range s.nodes {
-		score := CosineSimilarity(queryVec, node.Vector)
-		results = append(results, SearchResult{
-			ID:       node.ID,
-			Score:    score,
-			Metadata: node.Metadata,
-		})
+		score := cosineSimilarityWithQueryNorm(queryVec, node.Vector, normQ)
+
+		if h.Len() < limit {
+			heap.Push(h, SearchResult{
+				ID:       node.ID,
+				Score:    score,
+				Metadata: node.Metadata,
+			})
+		} else if score > (*h)[0].Score {
+			// If score is better than the worst score in the heap, replace it
+			(*h)[0] = SearchResult{
+				ID:       node.ID,
+				Score:    score,
+				Metadata: node.Metadata,
+			}
+			heap.Fix(h, 0)
+		}
 	}
 
-	// Sort matching results descending by similarity score
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
-
-	if limit > len(results) {
-		limit = len(results)
+	// Extract results from heap (they will come out in ascending order of score)
+	results := make([]SearchResult, h.Len())
+	for i := len(results) - 1; i >= 0; i-- {
+		results[i] = heap.Pop(h).(SearchResult)
 	}
-	return results[:limit]
+
+	return results
 }
 
 // CosineSimilarity calculates the cosine similarity score between two float32 slices
@@ -107,18 +144,32 @@ func CosineSimilarity(a, b []float32) float32 {
 		return 0.0
 	}
 
-	var dotProduct, normA, normB float32
+	var normA float32
+	for _, val := range a {
+		normA += val * val
+	}
+	normA = float32(math.Sqrt(float64(normA)))
+
+	return cosineSimilarityWithQueryNorm(a, b, normA)
+}
+
+func cosineSimilarityWithQueryNorm(a, b []float32, normA float32) float32 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0.0
+	}
+
+	var dotProduct, normB float32
 	for i := 0; i < len(a); i++ {
 		dotProduct += a[i] * b[i]
-		normA += a[i] * a[i]
 		normB += b[i] * b[i]
 	}
+	normB = float32(math.Sqrt(float64(normB)))
 
 	if normA == 0.0 || normB == 0.0 {
 		return 0.0
 	}
 
-	return dotProduct / (float32(math.Sqrt(float64(normA))) * float32(math.Sqrt(float64(normB))))
+	return dotProduct / (normA * normB)
 }
 
 // Float32SliceToBytes converts a float32 slice to a raw binary byte slice using unsafe pointer casting
