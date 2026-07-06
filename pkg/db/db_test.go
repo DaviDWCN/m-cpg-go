@@ -23,13 +23,13 @@ func TestGraphDB_Operations(t *testing.T) {
 
 	// 1. Test AddNode
 	nodeID1 := "module_test_pkg"
-	err = gdb.AddNode(nodeID1, "Module", "test_pkg", "test_pkg", "package test_pkg", "This is a test module", "project_1", map[string]any{"version": "1.0"})
+	err = gdb.AddNode(nil, nodeID1, "Module", "test_pkg", "test_pkg", "package test_pkg", "This is a test module", "project_1", map[string]any{"version": "1.0"})
 	if err != nil {
 		t.Errorf("failed to add node 1: %v", err)
 	}
 
 	nodeID2 := "class_Calculator"
-	err = gdb.AddNode(nodeID2, "Class", "Calculator", "test_pkg.Calculator", "type Calculator struct{}", "Calculates things", "project_1", nil)
+	err = gdb.AddNode(nil, nodeID2, "Class", "Calculator", "test_pkg.Calculator", "type Calculator struct{}", "Calculates things", "project_1", nil)
 	if err != nil {
 		t.Errorf("failed to add node 2: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestGraphDB_Operations(t *testing.T) {
 	}
 
 	// 3. Test AddEdge
-	err = gdb.AddEdge(nodeID1, nodeID2, "CONTAINS", map[string]any{"order": 1})
+	err = gdb.AddEdge(nil, nodeID1, nodeID2, "CONTAINS", map[string]any{"order": 1})
 	if err != nil {
 		t.Errorf("failed to add edge: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestGraphDB_Operations(t *testing.T) {
 
 	// 6. Test Save and Load Vectors
 	embData := []byte{1, 2, 3, 4, 5, 6, 7, 8} // dummy bytes
-	err = gdb.SaveVector(nodeID2, embData, map[string]any{"type": "Class"})
+	err = gdb.SaveVector(nil, nodeID2, embData, map[string]any{"type": "Class"})
 	if err != nil {
 		t.Errorf("failed to save vector: %v", err)
 	}

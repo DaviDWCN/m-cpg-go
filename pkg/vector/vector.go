@@ -1,10 +1,10 @@
 package vector
 
 import (
-	"bytes"
-	"encoding/binary"
 	"math"
+	"sort"
 	"sync"
+	"unsafe"
 )
 
 type VectorNode struct {
@@ -22,11 +22,13 @@ type SearchResult struct {
 type VectorStore struct {
 	mu    sync.RWMutex
 	nodes []VectorNode
+	index map[string]int // ID -> index in nodes
 }
 
 func NewVectorStore() *VectorStore {
 	return &VectorStore{
 		nodes: make([]VectorNode, 0),
+		index: make(map[string]int),
 	}
 }
 
@@ -36,14 +38,13 @@ func (s *VectorStore) AddVector(id string, vec []float32, metadata map[string]an
 	defer s.mu.Unlock()
 
 	// Update if exists, otherwise append
-	for i, node := range s.nodes {
-		if node.ID == id {
-			s.nodes[i].Vector = vec
-			s.nodes[i].Metadata = metadata
-			return
-		}
+	if idx, exists := s.index[id]; exists {
+		s.nodes[idx].Vector = vec
+		s.nodes[idx].Metadata = metadata
+		return
 	}
 
+	s.index[id] = len(s.nodes)
 	s.nodes = append(s.nodes, VectorNode{
 		ID:       id,
 		Vector:   vec,
@@ -56,12 +57,18 @@ func (s *VectorStore) RemoveVector(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i, node := range s.nodes {
-		if node.ID == id {
-			s.nodes = append(s.nodes[:i], s.nodes[i+1:]...)
-			return
-		}
+	idx, exists := s.index[id]
+	if !exists {
+		return
 	}
+
+	lastIdx := len(s.nodes) - 1
+	if idx != lastIdx {
+		s.nodes[idx] = s.nodes[lastIdx]
+		s.index[s.nodes[idx].ID] = idx
+	}
+	s.nodes = s.nodes[:lastIdx]
+	delete(s.index, id)
 }
 
 // Search retrieves the top K matching vectors using cosine similarity
@@ -83,19 +90,10 @@ func (s *VectorStore) Search(queryVec []float32, limit int) []SearchResult {
 		})
 	}
 
-	// Simple selection sort or bubble sort for small Top-K is fine.
-	// But let's write a standard sort.
-	for i := 0; i < len(results); i++ {
-		maxIdx := i
-		for j := i + 1; j < len(results); j++ {
-			if results[j].Score > results[maxIdx].Score {
-				maxIdx = j
-			}
-		}
-		if maxIdx != i {
-			results[i], results[maxIdx] = results[maxIdx], results[i]
-		}
-	}
+	// Sort matching results descending by similarity score
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
 
 	if limit > len(results) {
 		limit = len(results)
@@ -123,27 +121,18 @@ func CosineSimilarity(a, b []float32) float32 {
 	return dotProduct / (float32(math.Sqrt(float64(normA))) * float32(math.Sqrt(float64(normB))))
 }
 
-// Float32SliceToBytes converts a float32 slice to a raw binary byte slice
+// Float32SliceToBytes converts a float32 slice to a raw binary byte slice using unsafe pointer casting
 func Float32SliceToBytes(slice []float32) []byte {
-	buf := new(bytes.Buffer)
-	// Write each float in Little Endian order
-	for _, f := range slice {
-		binary.Write(buf, binary.LittleEndian, f)
-	}
-	return buf.Bytes()
-}
-
-// BytesToFloat32Slice converts raw binary bytes back to a float32 slice
-func BytesToFloat32Slice(data []byte) []float32 {
-	if len(data)%4 != 0 {
+	if len(slice) == 0 {
 		return nil
 	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&slice[0])), len(slice)*4)
+}
 
-	count := len(data) / 4
-	slice := make([]float32, count)
-	buf := bytes.NewReader(data)
-	for i := 0; i < count; i++ {
-		binary.Read(buf, binary.LittleEndian, &slice[i])
+// BytesToFloat32Slice converts raw binary bytes back to a float32 slice using unsafe pointer casting
+func BytesToFloat32Slice(data []byte) []float32 {
+	if len(data) == 0 || len(data)%4 != 0 {
+		return nil
 	}
-	return slice
+	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), len(data)/4)
 }

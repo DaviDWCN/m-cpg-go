@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -426,19 +428,90 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	allFiles := append(append(pyFiles, goFiles...), mdFiles...)
 	fmt.Fprintf(os.Stderr, "[MCP] Found %d files to analyze (Python, Go, Markdown).\n", len(allFiles))
 
-	nodesCount := 0
-	edgesCount := 0
-
+	// 1. Parse all files first in CPU memory (very fast)
+	var parsedEntities []parser.CodeEntity
+	var parsedRelations []parser.CodeRelation
 	for _, file := range allFiles {
 		entities, relations, err := parser.ParseFile(file, projectID, projectPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to parse %s: %v\n", file, err)
 			continue
 		}
+		parsedEntities = append(parsedEntities, entities...)
+		parsedRelations = append(parsedRelations, relations...)
+	}
 
-		// Insert nodes & generate vector embeddings
-		for _, ent := range entities {
-			// Choose what text to embed: prefer Docstring, fallback to Code (truncated), fallback to Name
+	if len(parsedEntities) == 0 {
+		return len(allFiles), 0, 0, nil
+	}
+
+	// 2. Parallel embedding calculation using goroutines
+	numWorkers := 8
+	if numWorkers > len(parsedEntities) {
+		numWorkers = len(parsedEntities)
+	}
+
+	type embedTask struct {
+		entityIndex int
+		text        string
+	}
+	type embedResult struct {
+		entityIndex int
+		embedding   []float32
+		err         error
+	}
+
+	tasksChan := make(chan embedTask, len(parsedEntities))
+	resultsChan := make(chan embedResult, len(parsedEntities))
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasksChan {
+				emb, err := vector.GetEmbedding(
+					task.text,
+					cfg.Embedding.Provider,
+					cfg.Embedding.Model,
+					cfg.Embedding.Endpoint,
+					cfg.Embedding.APIKey,
+				)
+				resultsChan <- embedResult{
+					entityIndex: task.entityIndex,
+					embedding:   emb,
+					err:         err,
+				}
+			}
+		}()
+	}
+
+	for i, ent := range parsedEntities {
+		embedText := ent.Docstring
+		if embedText == "" {
+			if len(ent.Code) > 1000 {
+				embedText = ent.Code[:1000]
+			} else {
+				embedText = ent.Code
+			}
+		}
+		if embedText == "" {
+			embedText = ent.Name
+		}
+		tasksChan <- embedTask{entityIndex: i, text: embedText}
+	}
+	close(tasksChan)
+
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	embeddings := make([][]float32, len(parsedEntities))
+	for res := range resultsChan {
+		if res.err != nil {
+			// On error, generate pseudo-embedding deterministically
+			ent := parsedEntities[res.entityIndex]
 			embedText := ent.Docstring
 			if embedText == "" {
 				if len(ent.Code) > 1000 {
@@ -450,42 +523,62 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			if embedText == "" {
 				embedText = ent.Name
 			}
+			res.embedding = vector.GeneratePseudoEmbedding(embedText)
+		}
+		embeddings[res.entityIndex] = res.embedding
+	}
 
-			// Add to sqlite graph DB
-			err = gdb.AddNode(ent.ID, ent.Type, ent.Name, ent.FQN, ent.Code, ent.Docstring, projectID, nil)
+	nodesCount := 0
+	edgesCount := 0
+
+	// 3. Write all entries to database in a single transaction
+	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+		// Insert nodes & vectors
+		for i, ent := range parsedEntities {
+			err = gdb.AddNode(tx, ent.ID, ent.Type, ent.Name, ent.FQN, ent.Code, ent.Docstring, projectID, nil)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[MCP] Failed to save node: %v\n", err)
-				continue
+				return fmt.Errorf("failed to save node: %w", err)
 			}
 			nodesCount++
 
-			// Fetch or generate vector embedding
-			emb, err := vector.GetEmbedding(
-				embedText,
-				cfg.Embedding.Provider,
-				cfg.Embedding.Model,
-				cfg.Embedding.Endpoint,
-				cfg.Embedding.APIKey,
-			)
-			if err == nil {
-				// Save embedding to sqlite vectors table
+			emb := embeddings[i]
+			if len(emb) > 0 {
 				embBytes := vector.Float32SliceToBytes(emb)
-				gdb.SaveVector(ent.ID, embBytes, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
-				
-				// Update in-memory vector store
+				err = gdb.SaveVector(tx, ent.ID, embBytes, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
+				if err != nil {
+					return fmt.Errorf("failed to save vector: %w", err)
+				}
 				vStore.AddVector(ent.ID, emb, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
 			}
 		}
 
+		// Keep track of newly inserted node IDs to bypass placeholder generation in edges insertion
+		insertedNodeIDs := make(map[string]bool)
+		for _, ent := range parsedEntities {
+			insertedNodeIDs[ent.ID] = true
+		}
+
 		// Insert edges
-		for _, rel := range relations {
-			err = gdb.AddEdge(rel.Source, rel.Target, rel.Label, nil)
+		for _, rel := range parsedRelations {
+			var err error
+			if insertedNodeIDs[rel.Source] && insertedNodeIDs[rel.Target] {
+				// Fast path: both nodes exist, execute direct insert
+				query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, '{}');`
+				_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label)
+			} else {
+				// Fallback path: one of the nodes might be external
+				err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, nil)
+			}
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[MCP] Failed to save edge: %v\n", err)
-				continue
+				return fmt.Errorf("failed to save edge: %w", err)
 			}
 			edgesCount++
 		}
+		return nil
+	})
+
+	if err != nil {
+		return 0, 0, 0, err
 	}
 
 	return len(allFiles), nodesCount, edgesCount, nil
@@ -668,7 +761,7 @@ func RunRemember(summary, details, eventType string, gdb *db.GraphDB, cfg *confi
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
-	err = gdb.SaveEvent(id, eventType, summary, details, timestamp, embBytes)
+	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes)
 	if err != nil {
 		return fmt.Errorf("failed to save memory to DB: %w", err)
 	}

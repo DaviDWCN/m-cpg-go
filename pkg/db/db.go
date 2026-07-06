@@ -14,6 +14,42 @@ type GraphDB struct {
 	db *sql.DB
 }
 
+type sqlExecutor interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func (g *GraphDB) getExecutor(tx *sql.Tx) sqlExecutor {
+	if tx != nil {
+		return tx
+	}
+	return g.db
+}
+
+// RunInTransaction runs the provided function in an SQLite transaction
+func (g *GraphDB) RunInTransaction(fn func(tx *sql.Tx) error) error {
+	tx, err := g.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
+}
+
+
 // InitDB initializes the SQLite database, creates schema, and returns GraphDB instance
 func InitDB(dbPath string) (*GraphDB, error) {
 	// Ensure parent directory exists
@@ -38,10 +74,18 @@ func InitDB(dbPath string) (*GraphDB, error) {
 }
 
 func (g *GraphDB) ensureSchema() error {
-	// Enable WAL mode for concurrency and performance
-	_, err := g.db.Exec("PRAGMA journal_mode=WAL;")
-	if err != nil {
-		return fmt.Errorf("failed to enable WAL: %w", err)
+	// Enable WAL mode and other optimizations for concurrency and performance
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL;",
+		"PRAGMA synchronous=NORMAL;",
+		"PRAGMA temp_store=MEMORY;",
+		"PRAGMA cache_size=-20000;",
+		"PRAGMA busy_timeout=5000;",
+	}
+	for _, pragma := range pragmas {
+		if _, err := g.db.Exec(pragma); err != nil {
+			return fmt.Errorf("failed to execute pragma %s: %w", pragma, err)
+		}
 	}
 
 	// Create nodes table
@@ -123,7 +167,7 @@ func (g *GraphDB) ensureSchema() error {
 }
 
 // AddNode inserts or replaces a node in the graph
-func (g *GraphDB) AddNode(id, nodeType, name, fqn, code, docstring, projectID string, props map[string]any) error {
+func (g *GraphDB) AddNode(tx *sql.Tx, id, nodeType, name, fqn, code, docstring, projectID string, props map[string]any) error {
 	propsJSON := "{}"
 	if len(props) > 0 {
 		data, err := json.Marshal(props)
@@ -137,7 +181,8 @@ func (g *GraphDB) AddNode(id, nodeType, name, fqn, code, docstring, projectID st
 	INSERT OR REPLACE INTO nodes (id, type, name, fqn, code, docstring, project_id, properties)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 	`
-	_, err := g.db.Exec(query, id, nodeType, name, fqn, code, docstring, projectID, propsJSON)
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(query, id, nodeType, name, fqn, code, docstring, projectID, propsJSON)
 	if err != nil {
 		return fmt.Errorf("failed to add node: %w", err)
 	}
@@ -146,7 +191,7 @@ func (g *GraphDB) AddNode(id, nodeType, name, fqn, code, docstring, projectID st
 
 // AddEdge inserts or replaces an edge in the graph. Source and Target must exist first to prevent foreign key issues,
 // but to make it simple we insert standard placeholders if they are missing (similar to KuzuAdapter).
-func (g *GraphDB) AddEdge(source, target, label string, props map[string]any) error {
+func (g *GraphDB) AddEdge(tx *sql.Tx, source, target, label string, props map[string]any) error {
 	propsJSON := "{}"
 	if len(props) > 0 {
 		data, err := json.Marshal(props)
@@ -156,12 +201,14 @@ func (g *GraphDB) AddEdge(source, target, label string, props map[string]any) er
 		propsJSON = string(data)
 	}
 
+	executor := g.getExecutor(tx)
+
 	// Ensure source node placeholder exists
 	ensureNodeQuery := `INSERT OR IGNORE INTO nodes (id, type, name, fqn, code, docstring, project_id, properties) VALUES (?, 'Node', ?, ?, '', '', '', '{}');`
-	if _, err := g.db.Exec(ensureNodeQuery, source, source, source); err != nil {
+	if _, err := executor.Exec(ensureNodeQuery, source, source, source); err != nil {
 		return fmt.Errorf("failed to ensure source node: %w", err)
 	}
-	if _, err := g.db.Exec(ensureNodeQuery, target, target, target); err != nil {
+	if _, err := executor.Exec(ensureNodeQuery, target, target, target); err != nil {
 		return fmt.Errorf("failed to ensure target node: %w", err)
 	}
 
@@ -169,7 +216,7 @@ func (g *GraphDB) AddEdge(source, target, label string, props map[string]any) er
 	INSERT OR REPLACE INTO edges (source, target, label, properties)
 	VALUES (?, ?, ?, ?);
 	`
-	_, err := g.db.Exec(query, source, target, label, propsJSON)
+	_, err := executor.Exec(query, source, target, label, propsJSON)
 	if err != nil {
 		return fmt.Errorf("failed to add edge: %w", err)
 	}
@@ -380,7 +427,7 @@ func (g *GraphDB) ClearProject(projectID string) error {
 }
 
 // SaveVector inserts or replaces a vector embedding associated with a node
-func (g *GraphDB) SaveVector(nodeID string, embedding []byte, metadata map[string]any) error {
+func (g *GraphDB) SaveVector(tx *sql.Tx, nodeID string, embedding []byte, metadata map[string]any) error {
 	metadataJSON := "{}"
 	if len(metadata) > 0 {
 		data, err := json.Marshal(metadata)
@@ -394,7 +441,8 @@ func (g *GraphDB) SaveVector(nodeID string, embedding []byte, metadata map[strin
 	INSERT OR REPLACE INTO vectors (node_id, embedding, metadata)
 	VALUES (?, ?, ?);
 	`
-	_, err := g.db.Exec(query, nodeID, embedding, metadataJSON)
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(query, nodeID, embedding, metadataJSON)
 	if err != nil {
 		return fmt.Errorf("failed to save vector: %w", err)
 	}
@@ -432,12 +480,13 @@ func (g *GraphDB) LoadVectors() ([]map[string]any, error) {
 }
 
 // SaveEvent inserts a new event (preference, error fix, session log) in the database
-func (g *GraphDB) SaveEvent(id, eventType, summary, details string, timestamp int64, embedding []byte) error {
+func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte) error {
 	query := `
 	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding)
 	VALUES (?, ?, ?, ?, ?, ?);
 	`
-	_, err := g.db.Exec(query, id, timestamp, eventType, summary, details, embedding)
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding)
 	if err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
