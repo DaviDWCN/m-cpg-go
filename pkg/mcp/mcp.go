@@ -655,13 +655,9 @@ func LoadVectorsIntoMemory(gdb *db.GraphDB, vStore *vector.VectorStore) error {
 	}
 
 	for _, v := range list {
-		nodeID := v["node_id"].(string)
-		embBytes := v["embedding"].([]byte)
-		meta := v["metadata"].(map[string]any)
-
-		emb := vector.BytesToFloat32Slice(embBytes)
+		emb := vector.BytesToFloat32Slice(v.Embedding)
 		if len(emb) > 0 {
-			vStore.AddVector(nodeID, emb, meta)
+			vStore.AddVector(v.NodeID, emb, v.Metadata)
 		}
 	}
 

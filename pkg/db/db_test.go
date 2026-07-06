@@ -89,8 +89,8 @@ func TestGraphDB_Operations(t *testing.T) {
 		t.Errorf("expected 1 vector, got %d", len(vectors))
 	} else {
 		vec := vectors[0]
-		if vec["node_id"] != nodeID2 {
-			t.Errorf("expected vector for %s, got %s", nodeID2, vec["node_id"])
+		if vec.NodeID != nodeID2 {
+			t.Errorf("expected vector for %s, got %s", nodeID2, vec.NodeID)
 		}
 	}
 

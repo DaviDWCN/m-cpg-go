@@ -449,8 +449,14 @@ func (g *GraphDB) SaveVector(tx *sql.Tx, nodeID string, embedding []byte, metada
 	return nil
 }
 
+type VectorRecord struct {
+	NodeID    string
+	Embedding []byte
+	Metadata  map[string]any
+}
+
 // LoadVectors loads all stored vectors from the database
-func (g *GraphDB) LoadVectors() ([]map[string]any, error) {
+func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 	query := "SELECT node_id, embedding, metadata FROM vectors;"
 	rows, err := g.db.Query(query)
 	if err != nil {
@@ -458,7 +464,7 @@ func (g *GraphDB) LoadVectors() ([]map[string]any, error) {
 	}
 	defer rows.Close()
 
-	var list []map[string]any
+	var list []VectorRecord
 	for rows.Next() {
 		var nodeID string
 		var embedding []byte
@@ -470,10 +476,10 @@ func (g *GraphDB) LoadVectors() ([]map[string]any, error) {
 		var metadata map[string]any
 		json.Unmarshal([]byte(metadataJSON), &metadata)
 
-		list = append(list, map[string]any{
-			"node_id":   nodeID,
-			"embedding": embedding,
-			"metadata":  metadata,
+		list = append(list, VectorRecord{
+			NodeID:    nodeID,
+			Embedding: embedding,
+			Metadata:  metadata,
 		})
 	}
 	return list, nil
