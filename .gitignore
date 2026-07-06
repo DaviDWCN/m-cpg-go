@@ -1,0 +1,31 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, contains systematically generated coverage reporting data
+*.out
+
+# Dependency directories
+vendor/
+
+# Local databases
+*.db
+*.db-journal
+*.db-wal
+data/
+
+# IDE configurations
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

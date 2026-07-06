@@ -1,0 +1,484 @@
+package db
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	_ "modernc.org/sqlite"
+)
+
+type GraphDB struct {
+	db *sql.DB
+}
+
+// InitDB initializes the SQLite database, creates schema, and returns GraphDB instance
+func InitDB(dbPath string) (*GraphDB, error) {
+	// Ensure parent directory exists
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create db directory: %w", err)
+	}
+
+	// Open SQLite database
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+
+	gdb := &GraphDB{db: db}
+	if err := gdb.ensureSchema(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return gdb, nil
+}
+
+func (g *GraphDB) ensureSchema() error {
+	// Enable WAL mode for concurrency and performance
+	_, err := g.db.Exec("PRAGMA journal_mode=WAL;")
+	if err != nil {
+		return fmt.Errorf("failed to enable WAL: %w", err)
+	}
+
+	// Create nodes table
+	createNodesTable := `
+	CREATE TABLE IF NOT EXISTS nodes (
+		id TEXT PRIMARY KEY,
+		type TEXT NOT NULL,
+		name TEXT NOT NULL,
+		fqn TEXT NOT NULL,
+		code TEXT,
+		docstring TEXT,
+		project_id TEXT,
+		properties TEXT
+	);`
+	if _, err := g.db.Exec(createNodesTable); err != nil {
+		return fmt.Errorf("failed to create nodes table: %w", err)
+	}
+
+	// Create edges table
+	createEdgesTable := `
+	CREATE TABLE IF NOT EXISTS edges (
+		source TEXT NOT NULL,
+		target TEXT NOT NULL,
+		label TEXT NOT NULL,
+		properties TEXT,
+		PRIMARY KEY (source, target, label),
+		FOREIGN KEY (source) REFERENCES nodes(id) ON DELETE CASCADE,
+		FOREIGN KEY (target) REFERENCES nodes(id) ON DELETE CASCADE
+	);`
+	if _, err := g.db.Exec(createEdgesTable); err != nil {
+		return fmt.Errorf("failed to create edges table: %w", err)
+	}
+
+	// Create vectors table
+	createVectorsTable := `
+	CREATE TABLE IF NOT EXISTS vectors (
+		node_id TEXT PRIMARY KEY,
+		embedding BLOB NOT NULL,
+		metadata TEXT,
+		FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+	);`
+	if _, err := g.db.Exec(createVectorsTable); err != nil {
+		return fmt.Errorf("failed to create vectors table: %w", err)
+	}
+
+	// Create events table for developer preferences and session logs
+	createEventsTable := `
+	CREATE TABLE IF NOT EXISTS events (
+		id TEXT PRIMARY KEY,
+		timestamp INTEGER NOT NULL,
+		event_type TEXT NOT NULL,
+		summary TEXT NOT NULL,
+		details TEXT,
+		embedding BLOB NOT NULL
+	);`
+	if _, err := g.db.Exec(createEventsTable); err != nil {
+		return fmt.Errorf("failed to create events table: %w", err)
+	}
+
+	// Create indexes for efficient retrieval and graph traversal
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_fqn ON nodes(fqn);",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_id);",
+		"CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);",
+		"CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);",
+		"CREATE INDEX IF NOT EXISTS idx_edges_label ON edges(label);",
+		"CREATE INDEX IF NOT EXISTS idx_vectors_node ON vectors(node_id);",
+		"CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
+	}
+
+	for _, idxQuery := range indexes {
+		if _, err := g.db.Exec(idxQuery); err != nil {
+			return fmt.Errorf("failed to create index (%s): %w", idxQuery, err)
+		}
+	}
+
+	return nil
+}
+
+// AddNode inserts or replaces a node in the graph
+func (g *GraphDB) AddNode(id, nodeType, name, fqn, code, docstring, projectID string, props map[string]any) error {
+	propsJSON := "{}"
+	if len(props) > 0 {
+		data, err := json.Marshal(props)
+		if err != nil {
+			return fmt.Errorf("failed to marshal node properties: %w", err)
+		}
+		propsJSON = string(data)
+	}
+
+	query := `
+	INSERT OR REPLACE INTO nodes (id, type, name, fqn, code, docstring, project_id, properties)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+	`
+	_, err := g.db.Exec(query, id, nodeType, name, fqn, code, docstring, projectID, propsJSON)
+	if err != nil {
+		return fmt.Errorf("failed to add node: %w", err)
+	}
+	return nil
+}
+
+// AddEdge inserts or replaces an edge in the graph. Source and Target must exist first to prevent foreign key issues,
+// but to make it simple we insert standard placeholders if they are missing (similar to KuzuAdapter).
+func (g *GraphDB) AddEdge(source, target, label string, props map[string]any) error {
+	propsJSON := "{}"
+	if len(props) > 0 {
+		data, err := json.Marshal(props)
+		if err != nil {
+			return fmt.Errorf("failed to marshal edge properties: %w", err)
+		}
+		propsJSON = string(data)
+	}
+
+	// Ensure source node placeholder exists
+	ensureNodeQuery := `INSERT OR IGNORE INTO nodes (id, type, name, fqn, code, docstring, project_id, properties) VALUES (?, 'Node', ?, ?, '', '', '', '{}');`
+	if _, err := g.db.Exec(ensureNodeQuery, source, source, source); err != nil {
+		return fmt.Errorf("failed to ensure source node: %w", err)
+	}
+	if _, err := g.db.Exec(ensureNodeQuery, target, target, target); err != nil {
+		return fmt.Errorf("failed to ensure target node: %w", err)
+	}
+
+	query := `
+	INSERT OR REPLACE INTO edges (source, target, label, properties)
+	VALUES (?, ?, ?, ?);
+	`
+	_, err := g.db.Exec(query, source, target, label, propsJSON)
+	if err != nil {
+		return fmt.Errorf("failed to add edge: %w", err)
+	}
+	return nil
+}
+
+// GetNode retrieves a node by its ID
+func (g *GraphDB) GetNode(id string) (map[string]any, error) {
+	query := "SELECT id, type, name, fqn, code, docstring, project_id, properties FROM nodes WHERE id = ?;"
+	row := g.db.QueryRow(query, id)
+
+	var nodeId, nodeType, name, fqn, code, docstring, projectID, propsJSON string
+	err := row.Scan(&nodeId, &nodeType, &name, &fqn, &code, &docstring, &projectID, &propsJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to scan node: %w", err)
+	}
+
+	var props map[string]any
+	if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+		props = make(map[string]any)
+	}
+
+	node := map[string]any{
+		"id":         nodeId,
+		"type":       nodeType,
+		"name":       name,
+		"fqn":        fqn,
+		"code":       code,
+		"docstring":  docstring,
+		"project_id": projectID,
+		"properties": props,
+	}
+	return node, nil
+}
+
+// GetEdges retrieves all incoming and outgoing edges for a node
+func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
+	// Query Outgoing Edges
+	outQuery := `
+	SELECT e.source, e.target, e.label, e.properties, n.type, n.name, n.fqn
+	FROM edges e
+	JOIN nodes n ON e.target = n.id
+	WHERE e.source = ?;`
+	
+	rows, err := g.db.Query(outQuery, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query outgoing edges: %w", err)
+	}
+	defer rows.Close()
+
+	var edges []map[string]any
+	for rows.Next() {
+		var src, dst, label, propsJSON, targetType, targetName, targetFqn string
+		if err := rows.Scan(&src, &dst, &label, &propsJSON, &targetType, &targetName, &targetFqn); err != nil {
+			return nil, err
+		}
+		var props map[string]any
+		json.Unmarshal([]byte(propsJSON), &props)
+
+		edges = append(edges, map[string]any{
+			"source":      src,
+			"target":      dst,
+			"label":       label,
+			"properties":  props,
+			"direction":   "outgoing",
+			"target_info": map[string]string{"type": targetType, "name": targetName, "fqn": targetFqn},
+		})
+	}
+
+	// Query Incoming Edges
+	inQuery := `
+	SELECT e.source, e.target, e.label, e.properties, n.type, n.name, n.fqn
+	FROM edges e
+	JOIN nodes n ON e.source = n.id
+	WHERE e.target = ?;`
+
+	inRows, err := g.db.Query(inQuery, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query incoming edges: %w", err)
+	}
+	defer inRows.Close()
+
+	for inRows.Next() {
+		var src, dst, label, propsJSON, sourceType, sourceName, sourceFqn string
+		if err := inRows.Scan(&src, &dst, &label, &propsJSON, &sourceType, &sourceName, &sourceFqn); err != nil {
+			return nil, err
+		}
+		var props map[string]any
+		json.Unmarshal([]byte(propsJSON), &props)
+
+		edges = append(edges, map[string]any{
+			"source":      src,
+			"target":      dst,
+			"label":       label,
+			"properties":  props,
+			"direction":   "incoming",
+			"source_info": map[string]string{"type": sourceType, "name": sourceName, "fqn": sourceFqn},
+		})
+	}
+
+	return edges, nil
+}
+
+// GetNeighbors retrieves neighboring nodes (nodes connected to the current node)
+func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
+	query := `
+	SELECT DISTINCT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties
+	FROM nodes n
+	JOIN edges e ON (e.source = n.id AND e.target = ?) OR (e.target = n.id AND e.source = ?)
+	WHERE n.id != ?;
+	`
+	rows, err := g.db.Query(query, nodeID, nodeID, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query neighbors: %w", err)
+	}
+	defer rows.Close()
+
+	var neighbors []map[string]any
+	for rows.Next() {
+		var id, nodeType, name, fqn, code, docstring, projectID, propsJSON string
+		if err := rows.Scan(&id, &nodeType, &name, &fqn, &code, &docstring, &projectID, &propsJSON); err != nil {
+			return nil, err
+		}
+		var props map[string]any
+		json.Unmarshal([]byte(propsJSON), &props)
+
+		neighbors = append(neighbors, map[string]any{
+			"id":         id,
+			"type":       nodeType,
+			"name":       name,
+			"fqn":        fqn,
+			"code":       code,
+			"docstring":  docstring,
+			"project_id": projectID,
+			"properties": props,
+		})
+	}
+	return neighbors, nil
+}
+
+// QueryNodes searches nodes by type, name, or FQN suffix matching
+func (g *GraphDB) QueryNodes(nodeType, nameFilter, projectID string) ([]map[string]any, error) {
+	sqlQuery := `SELECT id, type, name, fqn, code, docstring, project_id, properties FROM nodes WHERE 1=1`
+	var args []any
+
+	if nodeType != "" {
+		sqlQuery += " AND type = ?"
+		args = append(args, nodeType)
+	}
+	if nameFilter != "" {
+		sqlQuery += " AND (name = ? OR fqn LIKE ?)"
+		args = append(args, nameFilter, "%"+nameFilter)
+	}
+	if projectID != "" {
+		sqlQuery += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+
+	rows, err := g.db.Query(sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query nodes: %w", err)
+	}
+	defer rows.Close()
+
+	var nodes []map[string]any
+	for rows.Next() {
+		var id, nType, name, fqn, code, docstring, pID, propsJSON string
+		if err := rows.Scan(&id, &nType, &name, &fqn, &code, &docstring, &pID, &propsJSON); err != nil {
+			return nil, err
+		}
+		var props map[string]any
+		json.Unmarshal([]byte(propsJSON), &props)
+
+		nodes = append(nodes, map[string]any{
+			"id":         id,
+			"type":       nType,
+			"name":       name,
+			"fqn":        fqn,
+			"code":       code,
+			"docstring":  docstring,
+			"project_id": pID,
+			"properties": props,
+		})
+	}
+	return nodes, nil
+}
+
+// ClearProject deletes all nodes and edges belonging to a project
+func (g *GraphDB) ClearProject(projectID string) error {
+	// First delete all edges connected to these nodes (SQLite CASCADE foreign keys handles this, 
+	// but manual delete is safer in case foreign keys PRAGMA isn't fully enabled)
+	deleteEdges := `
+	DELETE FROM edges 
+	WHERE source IN (SELECT id FROM nodes WHERE project_id = ?)
+	   OR target IN (SELECT id FROM nodes WHERE project_id = ?);
+	`
+	if _, err := g.db.Exec(deleteEdges, projectID, projectID); err != nil {
+		return fmt.Errorf("failed to clear project edges: %w", err)
+	}
+
+	deleteNodes := "DELETE FROM nodes WHERE project_id = ?;"
+	if _, err := g.db.Exec(deleteNodes, projectID); err != nil {
+		return fmt.Errorf("failed to clear project nodes: %w", err)
+	}
+	return nil
+}
+
+// SaveVector inserts or replaces a vector embedding associated with a node
+func (g *GraphDB) SaveVector(nodeID string, embedding []byte, metadata map[string]any) error {
+	metadataJSON := "{}"
+	if len(metadata) > 0 {
+		data, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal vector metadata: %w", err)
+		}
+		metadataJSON = string(data)
+	}
+
+	query := `
+	INSERT OR REPLACE INTO vectors (node_id, embedding, metadata)
+	VALUES (?, ?, ?);
+	`
+	_, err := g.db.Exec(query, nodeID, embedding, metadataJSON)
+	if err != nil {
+		return fmt.Errorf("failed to save vector: %w", err)
+	}
+	return nil
+}
+
+// LoadVectors loads all stored vectors from the database
+func (g *GraphDB) LoadVectors() ([]map[string]any, error) {
+	query := "SELECT node_id, embedding, metadata FROM vectors;"
+	rows, err := g.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load vectors: %w", err)
+	}
+	defer rows.Close()
+
+	var list []map[string]any
+	for rows.Next() {
+		var nodeID string
+		var embedding []byte
+		var metadataJSON string
+		if err := rows.Scan(&nodeID, &embedding, &metadataJSON); err != nil {
+			return nil, err
+		}
+
+		var metadata map[string]any
+		json.Unmarshal([]byte(metadataJSON), &metadata)
+
+		list = append(list, map[string]any{
+			"node_id":   nodeID,
+			"embedding": embedding,
+			"metadata":  metadata,
+		})
+	}
+	return list, nil
+}
+
+// SaveEvent inserts a new event (preference, error fix, session log) in the database
+func (g *GraphDB) SaveEvent(id, eventType, summary, details string, timestamp int64, embedding []byte) error {
+	query := `
+	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding)
+	VALUES (?, ?, ?, ?, ?, ?);
+	`
+	_, err := g.db.Exec(query, id, timestamp, eventType, summary, details, embedding)
+	if err != nil {
+		return fmt.Errorf("failed to save event: %w", err)
+	}
+	return nil
+}
+
+// GetRecentEvents retrieves the most recent events from the database
+func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
+	query := `
+	SELECT id, timestamp, event_type, summary, details, embedding
+	FROM events
+	ORDER BY timestamp DESC
+	LIMIT ?;
+	`
+	rows, err := g.db.Query(query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []map[string]any
+	for rows.Next() {
+		var id, eventType, summary, details string
+		var timestamp int64
+		var embedding []byte
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding); err != nil {
+			return nil, err
+		}
+
+		events = append(events, map[string]any{
+			"id":         id,
+			"timestamp":  timestamp,
+			"event_type": eventType,
+			"summary":    summary,
+			"details":    details,
+			"embedding":  embedding,
+		})
+	}
+	return events, nil
+}
+
+func (g *GraphDB) Close() error {
+	return g.db.Close()
+}
