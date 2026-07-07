@@ -1,5 +1,6 @@
 # Binaries
 bin/
+deploy/m-cpg-go
 *.exe
 *.exe~
 *.dll
