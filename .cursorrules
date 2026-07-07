@@ -12,6 +12,13 @@ Before writing any new function, method, class, struct, or utility helper:
   - You must reuse, import, or extend the existing method/file.
   - If you need minor behavioral changes, refactor the existing code (e.g. by adding parameters, options, or using polymorphism) instead of duplicating the logic.
 
+### Standard Workflow for New Features:
+1. Plan the function signature or logic you need.
+2. Execute `m_cpg_find_duplicates` with that signature or description.
+3. Analyze the tool's response.
+4. **If no duplicates:** proceed to write the new function.
+5. **If duplicates found:** you MUST NOT create a new function. Instead, import and refactor/extend the existing function found by the tool.
+
 ## 2. General Development Rules
 1. **Zero CGO Dependencies**: Keep the Go implementation CGO-free. Use pure Go drivers (such as `modernc.org/sqlite` instead of CGO SQLite).
 2. **Robust Error Handling**: Always return errors explicitly instead of panicking or neglecting them. All external API requests must have deterministic fallbacks.
