@@ -9,4 +9,33 @@ A lightweight, in-process, zero-dependency Code Graph & Vector Memory System for
 - **MCP Server**: Implements the Model Context Protocol stdio transport for direct connection with AI IDEs (Cursor, Windsurf, Claude Desktop).
 
 ## Getting Started
-To be documented.
+
+### Building the Project
+
+Ensure you have Go installed (version 1.22+ recommended). You can build the production executable using the standard Go build command:
+
+```bash
+# Build the executable
+go build -o m-cpg-go .
+```
+
+### Usage
+
+Once built, you can run the executable directly from the root of the repository:
+
+```bash
+# Display help and available commands
+./m-cpg-go help
+
+# Launch the stdio MCP server for agent IDE connection
+./m-cpg-go mcp
+
+# Index source files (Python and Go) in a specific directory
+./m-cpg-go index <path-to-directory>
+
+# Optional: Index with a specific project ID
+./m-cpg-go index --project my-project-id <path-to-directory>
+
+# Perform a hybrid vector/graph search on the database
+./m-cpg-go search "your query here"
+```
