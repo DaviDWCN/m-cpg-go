@@ -69,6 +69,20 @@ func main() {
 		}
 		fmt.Printf("\nSUCCESS: Indexing finished!\n- Files Analyzed: %d\n- Graph Nodes Created: %d\n- Relationships Created: %d\n", files, nodes, edges)
 
+	case "init-bank":
+		// Initialize Memory Bank command
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: m-cpg-go init-bank <path-to-directory>")
+			os.Exit(1)
+		}
+		path := os.Args[2]
+		msg, err := mcp.RunInitMemoryBank(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(msg)
+
 	case "search":
 		// Query search command
 		searchFlags := flag.NewFlagSet("search", flag.ExitOnError)
@@ -119,5 +133,6 @@ func printUsage() {
 	fmt.Println("  mcp                               Launch the stdio MCP server for agent IDE connection")
 	fmt.Println("  index [--project <id>] <path>    Index source files (Python and Go) in a directory")
 	fmt.Println("  search [--top_k <n>] <query>      Perform a hybrid vector/graph search on the database")
+	fmt.Println("  init-bank <path>                  Initialize a Memory Bank in the specified directory")
 	fmt.Println("  help                              Display this help text")
 }
