@@ -182,6 +182,24 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 				},
 			},
 			{
+				Name:        "m_cpg_read_node",
+				Description: "Retrieves the full code and docstring for a specific node given its Fully Qualified Name (FQN).",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"fqn": map[string]string{
+							"type":        "string",
+							"description": "The Fully Qualified Name (FQN) of the node to read (e.g., pkg.module.ClassName.MethodName).",
+						},
+					},
+					Required: []string{"fqn"},
+				},
+			},
+			{
 				Name:        "m_cpg_get_file_structure",
 				Description: "Retrieves the structural hierarchy (classes, methods, modules) of a specific file from the code graph database.",
 				InputSchema: struct {
@@ -378,6 +396,24 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 
 		return &mcpToolCallResult{
 			Content: []mcpContent{{Type: "text", Text: contextText}},
+		}, nil
+
+	case "m_cpg_read_node":
+		var params struct {
+			Fqn string `json:"fqn"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+
+		res, err := RunReadNode(params.Fqn, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to read node: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
 		}, nil
 
 	case "m_cpg_find_duplicates":
@@ -783,12 +819,7 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 		}
 
 		if code != "" {
-			// Limit printed code length if too long
-			codeLines := strings.Split(code, "\n")
-			if len(codeLines) > 30 {
-				code = strings.Join(codeLines[:30], "\n") + "\n... [Code truncated, total lines: " + fmt.Sprintf("%d", len(codeLines)) + "]"
-			}
-			sb.WriteString(fmt.Sprintf("   Code:\n   ```\n   %s\n   ```\n", strings.ReplaceAll(code, "\n", "\n   ")))
+			sb.WriteString(fmt.Sprintf("   [Code omitted for progressive disclosure. Use m_cpg_read_node with fqn '%s' to read full code]\n", fqn))
 		}
 		sb.WriteString("--------------------------------------------------\n\n")
 	}
@@ -1138,4 +1169,40 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 	sb.WriteString("Recommendation: Follow DRY principles. Extend the existing method or class instead of copy-pasting or creating greenfield files.")
 
 	return sb.String(), nil
+}
+
+// RunReadNode retrieves the code and docstring for a specific node given its FQN.
+func RunReadNode(fqn string, gdb *db.GraphDB) (string, error) {
+	// Querying by FQN filter to prevent fetching the whole database
+	nodes, err := gdb.QueryNodes("", fqn, "")
+	if err != nil {
+		return "", err
+	}
+
+	for _, node := range nodes {
+		nodeFQN, ok := node["fqn"].(string)
+		if !ok {
+			continue
+		}
+		if nodeFQN == fqn {
+			nodeType, _ := node["type"].(string)
+			code, _ := node["code"].(string)
+			docstring, _ := node["docstring"].(string)
+
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("Node [%s] %s:\n", nodeType, fqn))
+			sb.WriteString("==================================================\n")
+			if docstring != "" {
+				sb.WriteString(fmt.Sprintf("Docstring:\n%s\n\n", docstring))
+			}
+			if code != "" {
+				sb.WriteString(fmt.Sprintf("Code:\n```\n%s\n```\n", code))
+			} else {
+				sb.WriteString("No code found for this node.\n")
+			}
+			return sb.String(), nil
+		}
+	}
+
+	return fmt.Sprintf("Node with FQN '%s' not found.", fqn), nil
 }
