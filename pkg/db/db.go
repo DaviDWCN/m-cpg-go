@@ -49,7 +49,6 @@ func (g *GraphDB) RunInTransaction(fn func(tx *sql.Tx) error) error {
 	return nil
 }
 
-
 // InitDB initializes the SQLite database, creates schema, and returns GraphDB instance
 func InitDB(dbPath string) (*GraphDB, error) {
 	// Ensure parent directory exists
@@ -263,7 +262,7 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 	FROM edges e
 	JOIN nodes n ON e.target = n.id
 	WHERE e.source = ?;`
-	
+
 	rows, err := g.db.Query(outQuery, nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query outgoing edges: %w", err)
@@ -277,7 +276,9 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 			return nil, err
 		}
 		var props map[string]any
-		json.Unmarshal([]byte(propsJSON), &props)
+		if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+			props = make(map[string]any)
+		}
 
 		edges = append(edges, map[string]any{
 			"source":      src,
@@ -287,6 +288,9 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 			"direction":   "outgoing",
 			"target_info": map[string]string{"type": targetType, "name": targetName, "fqn": targetFqn},
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating outgoing edges: %w", err)
 	}
 
 	// Query Incoming Edges
@@ -308,7 +312,9 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 			return nil, err
 		}
 		var props map[string]any
-		json.Unmarshal([]byte(propsJSON), &props)
+		if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+			props = make(map[string]any)
+		}
 
 		edges = append(edges, map[string]any{
 			"source":      src,
@@ -318,6 +324,9 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 			"direction":   "incoming",
 			"source_info": map[string]string{"type": sourceType, "name": sourceName, "fqn": sourceFqn},
 		})
+	}
+	if err := inRows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating incoming edges: %w", err)
 	}
 
 	return edges, nil
@@ -344,7 +353,9 @@ func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 			return nil, err
 		}
 		var props map[string]any
-		json.Unmarshal([]byte(propsJSON), &props)
+		if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+			props = make(map[string]any)
+		}
 
 		neighbors = append(neighbors, map[string]any{
 			"id":         id,
@@ -357,6 +368,10 @@ func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 			"properties": props,
 		})
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating neighbors: %w", err)
+	}
+
 	return neighbors, nil
 }
 
@@ -391,7 +406,9 @@ func (g *GraphDB) QueryNodes(nodeType, nameFilter, projectID string) ([]map[stri
 			return nil, err
 		}
 		var props map[string]any
-		json.Unmarshal([]byte(propsJSON), &props)
+		if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+			props = make(map[string]any)
+		}
 
 		nodes = append(nodes, map[string]any{
 			"id":         id,
@@ -404,12 +421,15 @@ func (g *GraphDB) QueryNodes(nodeType, nameFilter, projectID string) ([]map[stri
 			"properties": props,
 		})
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating nodes: %w", err)
+	}
 	return nodes, nil
 }
 
 // ClearProject deletes all nodes and edges belonging to a project
 func (g *GraphDB) ClearProject(projectID string) error {
-	// First delete all edges connected to these nodes (SQLite CASCADE foreign keys handles this, 
+	// First delete all edges connected to these nodes (SQLite CASCADE foreign keys handles this,
 	// but manual delete is safer in case foreign keys PRAGMA isn't fully enabled)
 	deleteEdges := `
 	DELETE FROM edges 
@@ -475,13 +495,18 @@ func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 		}
 
 		var metadata map[string]any
-		json.Unmarshal([]byte(metadataJSON), &metadata)
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			metadata = make(map[string]any)
+		}
 
 		list = append(list, VectorRecord{
 			NodeID:    nodeID,
 			Embedding: embedding,
 			Metadata:  metadata,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating vectors: %w", err)
 	}
 	return list, nil
 }
@@ -531,6 +556,9 @@ func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 			"details":    details,
 			"embedding":  embedding,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating events: %w", err)
 	}
 	return events, nil
 }

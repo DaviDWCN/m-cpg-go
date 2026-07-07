@@ -13,11 +13,11 @@ var (
 )
 
 type scope struct {
-	id          string
-	fqn         string
-	indent      int
-	entityType  string // "Class" or "Method"
-	startLine   int
+	id         string
+	fqn        string
+	indent     int
+	entityType string // "Class" or "Method"
+	startLine  int
 }
 
 // ParsePythonFile extracts modules, classes, and functions structurally from a Python file
@@ -178,7 +178,7 @@ func parseModuleDocstring(lines []string) string {
 	return doc
 }
 
-// parseDocstring looks for triple quotes (""" or ''') right after a def/class statement
+// parseDocstring looks for triple quotes (""" or ”') right after a def/class statement
 func parseDocstring(lines []string, startLine, expectedIndent int) (string, int) {
 	if startLine >= len(lines) {
 		return "", 0

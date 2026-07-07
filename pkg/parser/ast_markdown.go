@@ -9,10 +9,10 @@ import (
 )
 
 type mdScope struct {
-	id     string
-	fqn    string
-	level  int
-	text   []string
+	id    string
+	fqn   string
+	level int
+	text  []string
 }
 
 // ParseMarkdownFile parses a Markdown file, dividing it into sections by headings.
@@ -62,7 +62,7 @@ func ParseMarkdownFile(filePath, projectID, srcDir string) ([]CodeEntity, []Code
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		
+
 		if matches := headingRegex.FindStringSubmatch(trimmed); len(matches) > 1 {
 			hashes := matches[1]
 			headingText := strings.TrimSpace(matches[2])
@@ -70,7 +70,7 @@ func ParseMarkdownFile(filePath, projectID, srcDir string) ([]CodeEntity, []Code
 
 			// Clean heading text to use as safe identifier
 			safeName := cleanHeadingName(headingText)
-			
+
 			// Pop from stack until the parent heading has a lower level (closer to root)
 			for len(scopeStack) > 1 && scopeStack[len(scopeStack)-1].level >= level {
 				// Finalize text for the popped scope

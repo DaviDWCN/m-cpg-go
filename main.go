@@ -47,7 +47,7 @@ func main() {
 		// Index directory command
 		indexFlags := flag.NewFlagSet("index", flag.ExitOnError)
 		projectIDOpt := indexFlags.String("project", cfg.ProjectID, "Unique identifier for this project")
-		
+
 		if err := indexFlags.Parse(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error parsing index flags: %v\n", err)
 			os.Exit(1)
