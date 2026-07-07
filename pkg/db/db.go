@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -139,10 +140,22 @@ func (g *GraphDB) ensureSchema() error {
 		event_type TEXT NOT NULL,
 		summary TEXT NOT NULL,
 		details TEXT,
-		embedding BLOB NOT NULL
+		embedding BLOB NOT NULL,
+		status TEXT NOT NULL DEFAULT 'active'
 	);`
 	if _, err := g.db.Exec(createEventsTable); err != nil {
 		return fmt.Errorf("failed to create events table: %w", err)
+	}
+
+	// Handle migration for existing events table
+	// SQLite ALTER TABLE ADD COLUMN does not support IF NOT EXISTS in all versions natively without checking.
+	// We run it and safely ignore the "duplicate column name" error.
+	alterEventsTable := `ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'active';`
+	_, alterErr := g.db.Exec(alterEventsTable)
+	if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
+		// Only log or ignore, do not fail completely if it's already there or something similar.
+		// A fatal failure would prevent the app from starting.
+		fmt.Printf("[DB] Note: Could not alter events table (might already exist): %v\n", alterErr)
 	}
 
 	// Create indexes for efficient retrieval and graph traversal
@@ -512,16 +525,75 @@ func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 }
 
 // SaveEvent inserts a new event (preference, error fix, session log) in the database
-func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte) error {
+func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string) error {
 	query := `
-	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding)
-	VALUES (?, ?, ?, ?, ?, ?);
+	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status)
+	VALUES (?, ?, ?, ?, ?, ?, ?);
 	`
 	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding)
+	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status)
 	if err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
+	return nil
+}
+
+// GetAllActiveEvents retrieves all events where status = 'active'
+func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
+	query := `
+	SELECT id, timestamp, event_type, summary, details, embedding, status
+	FROM events
+	WHERE status = 'active'
+	ORDER BY timestamp DESC;
+	`
+	rows, err := g.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []map[string]any
+	for rows.Next() {
+		var id, eventType, summary, details, status string
+		var timestamp int64
+		var embedding []byte
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &status); err != nil {
+			return nil, fmt.Errorf("failed to scan event: %w", err)
+		}
+		events = append(events, map[string]any{
+			"id":         id,
+			"timestamp":  timestamp,
+			"event_type": eventType,
+			"summary":    summary,
+			"details":    details,
+			"embedding":  embedding,
+			"status":     status,
+		})
+	}
+	return events, nil
+}
+
+// ArchiveEvents updates the status of the given event IDs to 'archived'
+func (g *GraphDB) ArchiveEvents(tx *sql.Tx, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Use an IN clause for efficient batch updating
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`UPDATE events SET status = 'archived' WHERE id IN (%s);`, strings.Join(placeholders, ","))
+	executor := g.getExecutor(tx)
+
+	if _, err := executor.Exec(query, args...); err != nil {
+		return fmt.Errorf("failed to batch archive events: %w", err)
+	}
+
 	return nil
 }
 
