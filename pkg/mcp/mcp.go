@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -229,6 +230,51 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 				},
 			},
 			{
+				Name:        "m_cpg_search_memory",
+				Description: "Searches the agent's episodic and semantic memory for past bug fixes, preferences, and session context using vector similarity.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"query": map[string]string{
+							"type":        "string",
+							"description": "The search query (e.g. 'how did we fix the sqlite locking issue?').",
+						},
+						"limit": map[string]interface{}{
+							"type":        "integer",
+							"description": "Maximum number of results to retrieve (default 5).",
+						},
+					},
+					Required: []string{"query"},
+				},
+			},
+			{
+				Name:        "m_cpg_consolidate_memories",
+				Description: "Consolidates fragmented agent memories (events) into a high-level insight, archiving the old events.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"event_ids": map[string]interface{}{
+							"type":        "array",
+							"items":       map[string]string{"type": "string"},
+							"description": "List of memory event IDs to archive.",
+						},
+						"insight": map[string]string{
+							"type":        "string",
+							"description": "The consolidated insight/pattern derived from the events.",
+						},
+					},
+					Required: []string{"event_ids", "insight"},
+				},
+			},
+			{
 				Name:        "m_cpg_get_preferences",
 				Description: "Retrieves the persistent developer preferences and recent error-fixing logs from the agent memory.",
 				InputSchema: struct {
@@ -393,6 +439,48 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		}
 		return &mcpToolCallResult{
 			Content: []mcpContent{{Type: "text", Text: "Memory saved successfully!"}},
+		}, nil
+
+	case "m_cpg_search_memory":
+		var params struct {
+			Query string `json:"query"`
+			Limit *int   `json:"limit,omitempty"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+		limit := 5
+		if params.Limit != nil && *params.Limit > 0 {
+			limit = *params.Limit
+		}
+
+		res, err := RunSearchMemory(params.Query, limit, gdb, cfg)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to search memory: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_consolidate_memories":
+		var params struct {
+			EventIDs []string `json:"event_ids"`
+			Insight  string   `json:"insight"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+
+		res, err := RunConsolidateMemories(params.EventIDs, params.Insight, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to consolidate memory: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
 		}, nil
 
 	case "m_cpg_get_preferences":
@@ -708,6 +796,30 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	return sb.String(), nil
 }
 
+// RunConsolidateMemories archives the provided event IDs and returns a message to the agent to write the insight.
+func RunConsolidateMemories(eventIDs []string, insight string, gdb *db.GraphDB) (string, error) {
+	if len(eventIDs) == 0 {
+		return "No event IDs provided for consolidation.", nil
+	}
+
+	if err := gdb.ArchiveEvents(nil, eventIDs); err != nil {
+		return "", fmt.Errorf("failed to archive events: %w", err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Successfully archived the following fragmented events:\n")
+	for _, id := range eventIDs {
+		sb.WriteString(fmt.Sprintf("- %s\n", id))
+	}
+	sb.WriteString("\n")
+	sb.WriteString("Consolidated Insight:\n")
+	sb.WriteString(insight)
+	sb.WriteString("\n\n")
+	sb.WriteString("Next steps for Agent: Please append this consolidated insight into 'memory-bank/systemPatterns.md' or 'memory-bank/activeContext.md' using standard file editing tools to ensure it is kept in the working memory.")
+
+	return sb.String(), nil
+}
+
 func LoadVectorsIntoMemory(gdb *db.GraphDB, vStore *vector.VectorStore) error {
 	list, err := gdb.LoadVectors()
 	if err != nil {
@@ -798,6 +910,72 @@ func RunGetFileStructure(filePath, projectID string, gdb *db.GraphDB) (string, e
 	return sb.String(), nil
 }
 
+// RunSearchMemory retrieves active events related to the query using vector similarity
+func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Config) (string, error) {
+	emb, err := vector.GetEmbedding(
+		query,
+		cfg.Embedding.Provider,
+		cfg.Embedding.Model,
+		cfg.Embedding.Endpoint,
+		cfg.Embedding.APIKey,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to embed query: %w", err)
+	}
+
+	events, err := gdb.GetAllActiveEvents()
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve active events: %w", err)
+	}
+
+	type ScoredEvent struct {
+		Event map[string]any
+		Score float32
+	}
+	var scoredEvents []ScoredEvent
+
+	for _, ev := range events {
+		embBytes, ok := ev["embedding"].([]byte)
+		if !ok {
+			continue
+		}
+		evEmb := vector.BytesToFloat32Slice(embBytes)
+		score := vector.CosineSimilarity(emb, evEmb)
+		scoredEvents = append(scoredEvents, ScoredEvent{Event: ev, Score: score})
+	}
+
+	// Sort descending by score
+	sort.Slice(scoredEvents, func(i, j int) bool {
+		return scoredEvents[i].Score > scoredEvents[j].Score
+	})
+
+	if limit > len(scoredEvents) {
+		limit = len(scoredEvents)
+	}
+	topEvents := scoredEvents[:limit]
+
+	if len(topEvents) == 0 {
+		return "No active memories found matching the query.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Found %d memories matching '%s':\n\n", len(topEvents), query))
+	for i, se := range topEvents {
+		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] (ID: %s, Type: %s)\n", i+1, se.Score, se.Event["id"], se.Event["event_type"]))
+		sb.WriteString(fmt.Sprintf("   Summary: %s\n", se.Event["summary"]))
+		if details, ok := se.Event["details"].(string); ok && details != "" {
+			// truncate details if too long
+			if len(details) > 300 {
+				details = details[:300] + "..."
+			}
+			sb.WriteString(fmt.Sprintf("   Details: %s\n", strings.ReplaceAll(details, "\n", "\n   ")))
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String(), nil
+}
+
 // RunRemember saves a developer preference, compilation fix, or session log to the DB and generates vector embedding.
 func RunRemember(summary, details, eventType string, gdb *db.GraphDB, cfg *config.Config) error {
 	id := uuid.New().String()
@@ -817,7 +995,7 @@ func RunRemember(summary, details, eventType string, gdb *db.GraphDB, cfg *confi
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
-	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes)
+	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active")
 	if err != nil {
 		return fmt.Errorf("failed to save memory to DB: %w", err)
 	}
