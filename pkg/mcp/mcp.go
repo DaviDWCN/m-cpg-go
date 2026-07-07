@@ -160,7 +160,7 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 			},
 			{
 				Name:        "m_cpg_find_duplicates",
-				Description: "Checks if a proposed code snippet or functional description matches existing methods/files in the codebase to prevent semantic duplication.",
+				Description: "CRITICAL: You MUST use this tool BEFORE writing any new function, method, struct, or file to check if similar logic already exists. Checks if a proposed code snippet or functional description matches existing methods/files in the codebase to prevent semantic duplication.",
 				InputSchema: struct {
 					Type       string                 `json:"type"`
 					Properties map[string]interface{} `json:"properties"`
