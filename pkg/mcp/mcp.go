@@ -241,6 +241,24 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Required:   []string{},
 				},
 			},
+			{
+				Name:        "m_cpg_init_memory_bank",
+				Description: "Initializes a standard Memory Bank directory in the project root to store project documentation and context.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type:       "object",
+					Properties: map[string]interface{}{
+						"path": map[string]string{
+							"type":        "string",
+							"description": "Absolute path to the project directory where the memory-bank should be created.",
+						},
+					},
+					Required:   []string{"path"},
+				},
+			},
 		}
 
 		sendSuccessResponse(req.ID, map[string]interface{}{
@@ -382,6 +400,24 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to fetch preferences: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_init_memory_bank":
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+
+		res, err := RunInitMemoryBank(params.Path)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to initialize memory bank: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
