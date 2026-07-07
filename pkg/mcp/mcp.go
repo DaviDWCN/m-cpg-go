@@ -249,14 +249,14 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Properties map[string]interface{} `json:"properties"`
 					Required   []string               `json:"required"`
 				}{
-					Type:       "object",
+					Type: "object",
 					Properties: map[string]interface{}{
 						"path": map[string]string{
 							"type":        "string",
 							"description": "Absolute path to the project directory where the memory-bank should be created.",
 						},
 					},
-					Required:   []string{"path"},
+					Required: []string{"path"},
 				},
 			},
 		}
@@ -946,7 +946,7 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 	sb.WriteString("⚠️ WARNING: Potential Semantic Duplication Found!\n")
 	sb.WriteString("==================================================\n")
 	sb.WriteString("Before creating a new file or method, please examine if you can reuse, extend, or refactor the following existing elements:\n\n")
-	
+
 	for _, clash := range exactMatches {
 		sb.WriteString(clash)
 		sb.WriteString("\n")
