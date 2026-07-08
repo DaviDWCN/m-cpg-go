@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"m-cpg-go/pkg/concept"
 	"m-cpg-go/pkg/config"
 	"m-cpg-go/pkg/db"
 	"m-cpg-go/pkg/parser"
@@ -323,6 +324,24 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Required: []string{"path"},
 				},
 			},
+			{
+				Name:        "m_cpg_get_concept_hierarchy",
+				Description: "Retrieves the highest-frequency abstract concepts extracted from memory, providing a high-level knowledge hierarchy.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"limit": map[string]interface{}{
+							"type":        "integer",
+							"description": "Maximum number of top concepts to retrieve (default 20).",
+						},
+					},
+					Required: []string{},
+				},
+			},
 		}
 
 		sendSuccessResponse(req.ID, map[string]interface{}{
@@ -542,6 +561,28 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to initialize memory bank: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_get_concept_hierarchy":
+		var params struct {
+			Limit *int `json:"limit,omitempty"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+		limit := 20
+		if params.Limit != nil && *params.Limit > 0 {
+			limit = *params.Limit
+		}
+
+		res, err := RunGetConceptHierarchy(limit, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get concept hierarchy: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -837,6 +878,12 @@ func RunConsolidateMemories(eventIDs []string, insight string, gdb *db.GraphDB) 
 		return "", fmt.Errorf("failed to archive events: %w", err)
 	}
 
+	// Extract and save concepts from the insight
+	concepts := concept.ExtractConcepts(insight)
+	if err := gdb.SaveConcepts(nil, "", concepts); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to save concepts for insight: %v\n", err)
+	}
+
 	var sb strings.Builder
 	sb.WriteString("Successfully archived the following fragmented events:\n")
 	for _, id := range eventIDs {
@@ -1031,8 +1078,38 @@ func RunRemember(summary, details, eventType string, gdb *db.GraphDB, cfg *confi
 		return fmt.Errorf("failed to save memory to DB: %w", err)
 	}
 
+	// Extract and save abstract concepts
+	concepts := concept.ExtractConcepts(summary + " " + details)
+	if err := gdb.SaveConcepts(nil, id, concepts); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to save concepts for memory %s: %v\n", id, err)
+	}
+
 	fmt.Fprintf(os.Stderr, "[MCP] Successfully remembered event: %s\n", summary)
 	return nil
+}
+
+// RunGetConceptHierarchy retrieves top frequency concepts from the database
+func RunGetConceptHierarchy(limit int, gdb *db.GraphDB) (string, error) {
+	concepts, err := gdb.GetTopConcepts(limit)
+	if err != nil {
+		return "", err
+	}
+
+	if len(concepts) == 0 {
+		return "No extracted concepts found in the knowledge hierarchy.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("High-Level Knowledge Hierarchy (Top Abstract Concepts):\n")
+	sb.WriteString("=========================================================\n")
+
+	for i, c := range concepts {
+		name := c["name"].(string)
+		frequency := c["frequency"].(int)
+		sb.WriteString(fmt.Sprintf("%d. %s (Frequency: %d)\n", i+1, name, frequency))
+	}
+
+	return sb.String(), nil
 }
 
 // RunGetPreferences queries the most recent 10 events from memory
