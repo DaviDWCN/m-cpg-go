@@ -158,6 +158,29 @@ func (g *GraphDB) ensureSchema() error {
 		fmt.Printf("[DB] Note: Could not alter events table (might already exist): %v\n", alterErr)
 	}
 
+	// Create concepts table
+	createConceptsTable := `
+	CREATE TABLE IF NOT EXISTS concepts (
+		name TEXT PRIMARY KEY,
+		frequency INTEGER NOT NULL DEFAULT 1
+	);`
+	if _, err := g.db.Exec(createConceptsTable); err != nil {
+		return fmt.Errorf("failed to create concepts table: %w", err)
+	}
+
+	// Create event_concepts junction table
+	createEventConceptsTable := `
+	CREATE TABLE IF NOT EXISTS event_concepts (
+		event_id TEXT NOT NULL,
+		concept_name TEXT NOT NULL,
+		PRIMARY KEY (event_id, concept_name),
+		FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+		FOREIGN KEY (concept_name) REFERENCES concepts(name) ON DELETE CASCADE
+	);`
+	if _, err := g.db.Exec(createEventConceptsTable); err != nil {
+		return fmt.Errorf("failed to create event_concepts table: %w", err)
+	}
+
 	// Create indexes for efficient retrieval and graph traversal
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);",
@@ -168,6 +191,7 @@ func (g *GraphDB) ensureSchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_edges_label ON edges(label);",
 		"CREATE INDEX IF NOT EXISTS idx_vectors_node ON vectors(node_id);",
 		"CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
+		"CREATE INDEX IF NOT EXISTS idx_concepts_freq ON concepts(frequency DESC);",
 	}
 
 	for _, idxQuery := range indexes {
@@ -633,6 +657,71 @@ func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 		return nil, fmt.Errorf("error iterating events: %w", err)
 	}
 	return events, nil
+}
+
+// SaveConcepts inserts or updates concept frequencies and links them to an event
+func (g *GraphDB) SaveConcepts(tx *sql.Tx, eventID string, concepts []string) error {
+	if len(concepts) == 0 {
+		return nil
+	}
+
+	executor := g.getExecutor(tx)
+
+	for _, concept := range concepts {
+		// Update concept frequency
+		upsertConceptQuery := `
+		INSERT INTO concepts (name, frequency)
+		VALUES (?, 1)
+		ON CONFLICT(name) DO UPDATE SET frequency = frequency + 1;
+		`
+		if _, err := executor.Exec(upsertConceptQuery, concept); err != nil {
+			return fmt.Errorf("failed to upsert concept: %w", err)
+		}
+
+		// Link to event if eventID is provided
+		if eventID != "" {
+			linkQuery := `
+			INSERT OR IGNORE INTO event_concepts (event_id, concept_name)
+			VALUES (?, ?);
+			`
+			if _, err := executor.Exec(linkQuery, eventID, concept); err != nil {
+				return fmt.Errorf("failed to link concept to event: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// GetTopConcepts retrieves the highest frequency concepts
+func (g *GraphDB) GetTopConcepts(limit int) ([]map[string]any, error) {
+	query := `
+	SELECT name, frequency
+	FROM concepts
+	ORDER BY frequency DESC
+	LIMIT ?;
+	`
+	rows, err := g.db.Query(query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query top concepts: %w", err)
+	}
+	defer rows.Close()
+
+	var concepts []map[string]any
+	for rows.Next() {
+		var name string
+		var frequency int
+		if err := rows.Scan(&name, &frequency); err != nil {
+			return nil, err
+		}
+		concepts = append(concepts, map[string]any{
+			"name":      name,
+			"frequency": frequency,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating concepts: %w", err)
+	}
+	return concepts, nil
 }
 
 func (g *GraphDB) Close() error {
