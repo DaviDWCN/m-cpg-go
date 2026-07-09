@@ -311,6 +311,28 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 				},
 			},
 			{
+				Name:        "m_cpg_ingest_conversation",
+				Description: "Ingests a segment of conversation transcript or context into the Cold memory layer. This allows the system to passively retain conversation history for future context retrieval.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"transcript": map[string]interface{}{
+							"type":        "string",
+							"description": "The raw transcript or context chunk of the conversation to ingest.",
+						},
+						"summary": map[string]interface{}{
+							"type":        "string",
+							"description": "A brief summary of what this conversation segment is about.",
+						},
+					},
+					Required: []string{"transcript", "summary"},
+				},
+			},
+			{
 				Name:        "m_cpg_init_memory_bank",
 				Description: "Initializes a standard Memory Bank directory in the project root to store project documentation and context.",
 				InputSchema: struct {
@@ -344,6 +366,19 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 						},
 					},
 					Required: []string{},
+				},
+			},
+			{
+				Name:        "m_cpg_kb_bootstrap",
+				Description: "Initiates the Knowledge Base bootstrapper. It aggregates hot memory layers (recent events, active concepts) and prepares the session context dynamically. Call this tool ONCE at the very beginning of a new AI session to establish context.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type:       "object",
+					Properties: map[string]interface{}{},
+					Required:   []string{},
 				},
 			},
 			{
@@ -584,6 +619,45 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to initialize memory bank: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_kb_bootstrap":
+		// kb_bootstrap essentially aliases getting the hot context, but sets the semantic expectation
+		// for agent initialization logic as defined in the Knowledge Base docs.
+		res, err := RunGetHotContext(gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to bootstrap KB: %v", err)}},
+			}, nil
+		}
+
+		header := "# 🧠 Knowledge Base Bootstrapped successfully\n\n"
+		header += "The session context has been loaded from the Hot Memory Layer.\n\n"
+
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: header + res}},
+		}, nil
+
+	case "m_cpg_ingest_conversation":
+		var params struct {
+			Transcript string `json:"transcript"`
+			Summary    string `json:"summary"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, fmt.Errorf("invalid arguments: %v", err)
+		}
+		if params.Transcript == "" || params.Summary == "" {
+			return nil, fmt.Errorf("transcript and summary are required")
+		}
+
+		res, err := RunIngestConversation(gdb, cfg, params.Transcript, params.Summary)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to ingest conversation: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -1159,6 +1233,38 @@ func RunGetConceptHierarchy(limit int, gdb *db.GraphDB) (string, error) {
 	}
 
 	return sb.String(), nil
+}
+
+// RunIngestConversation ingests a transcript chunk as an event (Cold Layer proxy)
+func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summary string) (string, error) {
+	err := gdb.RunInTransaction(func(tx *sql.Tx) error {
+		id := "conv_" + uuid.New().String()
+		now := time.Now().Unix()
+		details := fmt.Sprintf("Conversation Transcript:\n%s", transcript)
+
+		// Create vector embedding for the transcript summary
+		emb, err := vector.GetEmbedding(summary+"\n"+transcript, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey)
+		if err != nil {
+			return fmt.Errorf("failed to generate embedding: %v", err)
+		}
+		var embBytes []byte
+		if emb != nil {
+			embBytes, _ = json.Marshal(emb)
+		}
+
+		// Save as an event with type 'conversation', importance 2 (default cold layer)
+		err = gdb.SaveEvent(tx, id, "conversation", summary, details, now, embBytes, "archived", 2)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return "Conversation successfully ingested into the Cold memory layer.", nil
 }
 
 // RunGetHotContext queries the most recent 5 active events and top 5 concepts to generate a dynamic hot context index

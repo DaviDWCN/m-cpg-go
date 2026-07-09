@@ -1,0 +1,13 @@
+--- pkg/db/db.go
++++ pkg/db/db.go
+@@ -432,10 +432,9 @@
+		FROM edges e
+		JOIN nodes n ON e.target = n.id
+		JOIN search_graph sg ON e.source = sg.id
+		WHERE sg.depth < ?
+		  AND (e.label = 'CONTAINS' OR e.label = 'CALLS')
+-		  AND instr(sg.path, n.id) = 0
++		  AND instr(sg.path || '->', '->' || n.id || '->') = 0
+	)
+	SELECT id, type, name, fqn, MIN(depth) as min_depth
+	FROM search_graph
