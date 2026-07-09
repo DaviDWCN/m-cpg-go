@@ -172,7 +172,7 @@ func ParseGoFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelati
 		})
 	}
 
-	return entities, relations, nil
+	return entities, AggregateRelations(relations), nil
 }
 
 func getCommentGroupText(cg *ast.CommentGroup) string {

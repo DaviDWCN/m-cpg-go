@@ -2,7 +2,11 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 )
@@ -20,16 +24,182 @@ type scope struct {
 	startLine  int
 }
 
+type pythonASTResult struct {
+	Entities  []CodeEntity
+	Relations []CodeRelation
+}
+
 // ParsePythonFile extracts modules, classes, and functions structurally from a Python file
 func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelation, error) {
+	fileContent, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	moduleFqn := DeriveFQN(filePath, srcDir)
+	moduleID := "module_" + moduleFqn
+
+	// Try the python ast approach first
+	entities, relations, err := parsePythonFileWithAST(string(fileContent), moduleFqn, moduleID)
+	if err == nil {
+		return entities, AggregateRelations(relations), nil
+	}
+
+	// Fallback to regex-based parsing if Python is not available or script fails
+	entities, relations, err = parsePythonFileRegex(filePath, moduleFqn, moduleID)
+	return entities, AggregateRelations(relations), err
+}
+
+func parsePythonFileWithAST(code, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {
+	pythonScript := `
+import ast
+import json
+import sys
+
+def get_code_slice(lines, start_line, end_line):
+    if end_line is None:
+        return ""
+    # ast lineno is 1-indexed, inclusive
+    # end_lineno is also 1-indexed, inclusive
+    return "\n".join(lines[start_line-1:end_line])
+
+def parse(code, module_fqn, module_id):
+    lines = code.split("\n")
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+
+    entities = []
+    relations = []
+
+    entities.append({
+        "ID": module_id,
+        "Type": "Module",
+        "Name": module_fqn.split('.')[-1] if '.' in module_fqn else module_fqn,
+        "FQN": module_fqn,
+        "Code": code,
+        "Docstring": ast.get_docstring(tree) or "",
+        "ParentID": ""
+    })
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.scope_stack = [(module_id, module_fqn)]
+
+        def visit_ClassDef(self, node):
+            parent_id, parent_fqn = self.scope_stack[-1]
+            class_name = node.name
+            class_fqn = f"{parent_fqn}.{class_name}"
+            class_id = f"class_{class_fqn}"
+
+            entities.append({
+                "ID": class_id,
+                "Type": "Class",
+                "Name": class_name,
+                "FQN": class_fqn,
+                "Code": get_code_slice(lines, node.lineno, getattr(node, 'end_lineno', node.lineno)),
+                "Docstring": ast.get_docstring(node) or "",
+                "ParentID": parent_id
+            })
+
+            relations.append({
+                "Source": parent_id,
+                "Target": class_id,
+                "Label": "CONTAINS"
+            })
+
+            self.scope_stack.append((class_id, class_fqn))
+            self.generic_visit(node)
+            self.scope_stack.pop()
+
+        def visit_FunctionDef(self, node):
+            self.handle_function(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            self.handle_function(node)
+
+        def handle_function(self, node):
+            parent_id, parent_fqn = self.scope_stack[-1]
+            func_name = node.name
+            func_fqn = f"{parent_fqn}.{func_name}"
+            func_id = f"method_{func_fqn}"
+
+            entities.append({
+                "ID": func_id,
+                "Type": "Method",
+                "Name": func_name,
+                "FQN": func_fqn,
+                "Code": get_code_slice(lines, node.lineno, getattr(node, 'end_lineno', node.lineno)),
+                "Docstring": ast.get_docstring(node) or "",
+                "ParentID": parent_id
+            })
+
+            relations.append({
+                "Source": parent_id,
+                "Target": func_id,
+                "Label": "CONTAINS"
+            })
+
+            class CallVisitor(ast.NodeVisitor):
+                def visit_Call(self, call_node):
+                    target_name = None
+                    if isinstance(call_node.func, ast.Name):
+                        target_name = call_node.func.id
+                    elif isinstance(call_node.func, ast.Attribute):
+                        target_name = call_node.func.attr
+
+                    if target_name:
+                        relations.append({
+                            "Source": func_id,
+                            "Target": f"call_{target_name}",
+                            "Label": "CALLS"
+                        })
+                    self.generic_visit(call_node)
+
+            cv = CallVisitor()
+            for stmt in node.body:
+                cv.visit(stmt)
+
+            self.scope_stack.append((func_id, func_fqn))
+            self.generic_visit(node)
+            self.scope_stack.pop()
+
+    Visitor().visit(tree)
+    return {"Entities": entities, "Relations": relations}
+
+if __name__ == "__main__":
+    code = sys.stdin.read()
+    module_fqn = sys.argv[1]
+    module_id = sys.argv[2]
+    res = parse(code, module_fqn, module_id)
+    print(json.dumps(res))
+`
+
+	cmd := exec.Command("python3", "-c", pythonScript, moduleFqn, moduleID)
+	cmd.Stdin = strings.NewReader(code)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	if err := cmd.Run(); err != nil {
+		return nil, nil, fmt.Errorf("python script failed: %w", err)
+	}
+
+	var result pythonASTResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		return nil, nil, fmt.Errorf("failed to unmarshal python script output: %w", err)
+	}
+
+	return result.Entities, result.Relations, nil
+}
+
+func parsePythonFileRegex(filePath, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer file.Close()
-
-	moduleFqn := DeriveFQN(filePath, srcDir)
-	moduleID := "module_" + moduleFqn
 
 	var entities []CodeEntity
 	var relations []CodeRelation
