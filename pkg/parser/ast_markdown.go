@@ -115,7 +115,7 @@ func ParseMarkdownFile(filePath, projectID, srcDir string) ([]CodeEntity, []Code
 		scopeStack = scopeStack[:len(scopeStack)-1]
 	}
 
-	return entities, relations, nil
+	return entities, AggregateRelations(relations), nil
 }
 
 func cleanHeadingName(heading string) string {

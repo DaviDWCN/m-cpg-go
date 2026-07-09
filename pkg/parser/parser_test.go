@@ -216,3 +216,85 @@ These are details of product context.
 		t.Errorf("expected relations, got 0")
 	}
 }
+
+func TestParseTSFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "m-cpg-parser-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tsCode := `// Helper TS file
+export class Greeter {
+    private prefix: string;
+
+    constructor(prefix: string) {
+        this.prefix = prefix;
+    }
+
+    public greet(name: string): string {
+        console.log("Greeting...");
+        return this.prefix + name;
+    }
+}
+
+export const helperFunction = (val: number) => {
+    return val * 2;
+}
+
+async function doSomething() {
+    helperFunction(10);
+}
+`
+
+	tsFile := filepath.Join(tmpDir, "helper.ts")
+	if err := os.WriteFile(tsFile, []byte(tsCode), 0644); err != nil {
+		t.Fatalf("failed to write test ts file: %v", err)
+	}
+
+	entities, relations, err := ParseTSFile(tsFile, "test-proj", tmpDir)
+	if err != nil {
+		t.Fatalf("ParseTSFile failed: %v", err)
+	}
+
+	foundClass := false
+	foundMethod := false
+	foundArrowFunc := false
+	foundAsyncFunc := false
+	foundCalls := false
+
+	for _, ent := range entities {
+		switch ent.Type {
+		case "Class":
+			if ent.Name == "Greeter" {
+				foundClass = true
+			}
+		case "Method":
+			if ent.Name == "greet" {
+				foundMethod = true
+				if ent.ParentID != "class_helper.Greeter" {
+					t.Errorf("expected parent to be 'class_helper.Greeter', got '%s'", ent.ParentID)
+				}
+			} else if ent.Name == "helperFunction" {
+				foundArrowFunc = true
+			} else if ent.Name == "doSomething" {
+				foundAsyncFunc = true
+			}
+		}
+	}
+
+	if !foundClass || !foundMethod || !foundArrowFunc || !foundAsyncFunc {
+		t.Errorf("failed to extract TS structures: class=%t, method=%t, arrow=%t, async=%t",
+			foundClass, foundMethod, foundArrowFunc, foundAsyncFunc)
+	}
+
+	for _, rel := range relations {
+		if rel.Source == "method_helper.doSomething" && rel.Target == "call_helperFunction" && rel.Label == "CALLS" {
+			foundCalls = true
+		}
+	}
+
+	if !foundCalls {
+		t.Errorf("failed to extract TS CALLS relation")
+	}
+}

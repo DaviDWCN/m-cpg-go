@@ -896,11 +896,16 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 				var err error
 				if insertedNodeIDs[rel.Source] && insertedNodeIDs[rel.Target] {
 					// Fast path: both nodes exist, execute direct insert
-					query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, '{}');`
-					_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label)
+					propsJSON := "{}"
+					if len(rel.Properties) > 0 {
+						data, _ := json.Marshal(rel.Properties)
+						propsJSON = string(data)
+					}
+					query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, ?);`
+					_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label, propsJSON)
 				} else {
 					// Fallback path: one of the nodes might be external
-					err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, nil)
+					err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, rel.Properties)
 				}
 				if err != nil {
 					return fmt.Errorf("failed to save edge: %w", err)

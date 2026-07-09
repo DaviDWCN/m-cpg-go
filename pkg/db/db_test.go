@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -102,5 +103,80 @@ func TestGraphDB_Operations(t *testing.T) {
 	n2, _ := gdb.GetNode(nodeID2)
 	if n2 != nil {
 		t.Errorf("expected node 2 to be deleted after clearing project")
+	}
+}
+
+func TestQueryPattern(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test_pattern.db")
+	gdb, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer gdb.Close()
+
+	// Seed data
+	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+		gdb.AddNode(tx, "m1", "Method", "FuncA", "pkg.FuncA", "", "", "proj", nil)
+		gdb.AddNode(tx, "m2", "Method", "FuncB", "pkg.FuncB", "", "", "proj", nil)
+		gdb.AddNode(tx, "c1", "Class", "ClassA", "pkg.ClassA", "", "", "proj", nil)
+
+		gdb.AddEdge(tx, "m1", "m2", "CALLS", map[string]any{"weight": 2})
+		gdb.AddEdge(tx, "c1", "m1", "CONTAINS", nil)
+
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("seeding failed: %v", err)
+	}
+
+	// Test case 1: Method -> CALLS -> Method
+	res, err := gdb.QueryPattern("Method(*) -> CALLS -> Method(FuncB)", 1)
+	if err != nil {
+		t.Fatalf("QueryPattern failed: %v", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(res))
+	}
+
+	srcMap := res[0]["source"].(map[string]any)
+	if srcMap["name"] != "FuncA" {
+		t.Errorf("expected source to be FuncA")
+	}
+
+	// Test case 2: Class -> CONTAINS -> Method
+	res2, err := gdb.QueryPattern("Class(ClassA) -> CONTAINS -> Method(*)", 1)
+	if err != nil {
+		t.Fatalf("QueryPattern failed: %v", err)
+	}
+	if len(res2) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(res2))
+	}
+
+	srcMap2 := res2[0]["source"].(map[string]any)
+	if srcMap2["name"] != "ClassA" {
+		t.Errorf("expected source to be ClassA")
+	}
+
+	// Seed multihop data
+	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+		gdb.AddNode(tx, "m3", "Method", "FuncC", "pkg.FuncC", "", "", "proj", nil)
+		gdb.AddEdge(tx, "m2", "m3", "CALLS", nil)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seeding multihop failed: %v", err)
+	}
+
+	// Test case 3: Multihop Method -> CALLS -> Method(FuncC)
+	res3, err := gdb.QueryPattern("Method(FuncA) -> CALLS -> Method(FuncC)", 2)
+	if err != nil {
+		t.Fatalf("QueryPattern failed: %v", err)
+	}
+	if len(res3) != 1 {
+		t.Fatalf("expected 1 multihop result, got %d", len(res3))
+	}
+	if res3[0]["depth"].(int) != 2 {
+		t.Errorf("expected depth 2, got %v", res3[0]["depth"])
 	}
 }
