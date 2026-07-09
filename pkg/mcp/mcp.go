@@ -244,6 +244,10 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 							"type":        "string",
 							"description": "Type of memory: 'error_fix', 'preference', 'session_log'.",
 						},
+							"importance": map[string]interface{}{
+								"type":        "integer",
+								"description": "Optional importance score (0-10, default 0). High-importance memories will be injected into the Hot Context at session start.",
+							},
 					},
 					Required: []string{"summary", "details", "event_type"},
 				},
@@ -340,6 +344,19 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 						},
 					},
 					Required: []string{},
+				},
+			},
+			{
+				Name:        "m_cpg_get_hot_context",
+				Description: "Retrieves a dynamic, highly condensed markdown index representing Current Tasks, Unresolved Issues, and Active Entities (Hot Memory Layer) to be injected at session start.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type:       "object",
+					Properties: map[string]interface{}{},
+					Required:   []string{},
 				},
 			},
 		}
@@ -478,15 +495,21 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 
 	case "m_cpg_remember":
 		var params struct {
-			Summary   string `json:"summary"`
-			Details   string `json:"details"`
-			EventType string `json:"event_type"`
+			Summary    string `json:"summary"`
+			Details    string `json:"details"`
+			EventType  string `json:"event_type"`
+			Importance *int   `json:"importance,omitempty"`
 		}
 		if err := json.Unmarshal(args, &params); err != nil {
 			return nil, err
 		}
 
-		err := RunRemember(params.Summary, params.Details, params.EventType, gdb, cfg)
+		importance := 0
+		if params.Importance != nil {
+			importance = *params.Importance
+		}
+
+		err := RunRemember(params.Summary, params.Details, params.EventType, importance, gdb, cfg)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to save memory: %v", err)}},
@@ -561,6 +584,17 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to initialize memory bank: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_get_hot_context":
+		res, err := RunGetHotContext(gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get hot context: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -822,47 +856,62 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 		return "", fmt.Errorf("failed to embed query: %w", err)
 	}
 
-	// 2. Query VectorStore for matching IDs
-	results := vStore.Search(emb, topK)
-	if len(results) == 0 {
-		return fmt.Sprintf("No relevant code memory found for query: '%s'", query), nil
-	}
-
-	// 3. Construct context output from graph & node data
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Hybrid Search Results for query: '%s'\n", query))
 	sb.WriteString("==================================================\n\n")
 
-	for i, res := range results {
-		node, err := gdb.GetNode(res.ID)
-		if err != nil || node == nil {
-			continue
-		}
-
-		nodeType := node["type"].(string)
-		fqn := node["fqn"].(string)
-		code := node["code"].(string)
-		docstring := node["docstring"].(string)
-
-		sb.WriteString(fmt.Sprintf("%d. [%s] %s (Score: %.4f)\n", i+1, nodeType, fqn, res.Score))
-		if docstring != "" {
-			sb.WriteString(fmt.Sprintf("   Docstring: %s\n", strings.ReplaceAll(docstring, "\n", "\n   ")))
-		}
-
-		// Fetch neighboring classes/methods/modules
-		neighbors, _ := gdb.GetNeighbors(res.ID)
-		if len(neighbors) > 0 {
-			var nList []string
-			for _, n := range neighbors {
-				nList = append(nList, fmt.Sprintf("%s (%s)", n["name"], n["type"]))
+	// 2. Query VectorStore for matching IDs (Code Nodes)
+	results := vStore.Search(emb, topK)
+	if len(results) > 0 {
+		sb.WriteString("## Code Graph Memories:\n")
+		for i, res := range results {
+			node, err := gdb.GetNode(res.ID)
+			if err != nil || node == nil {
+				continue
 			}
-			sb.WriteString(fmt.Sprintf("   Neighbors: %s\n", strings.Join(nList, ", ")))
-		}
 
-		if code != "" {
-			sb.WriteString(fmt.Sprintf("   [Code omitted for progressive disclosure. Use m_cpg_read_node with fqn '%s' to read full code]\n", fqn))
+			nodeType := node["type"].(string)
+			fqn := node["fqn"].(string)
+			code := node["code"].(string)
+			docstring := node["docstring"].(string)
+
+			sb.WriteString(fmt.Sprintf("%d. [%s] %s (Score: %.4f)\n", i+1, nodeType, fqn, res.Score))
+			if docstring != "" {
+				sb.WriteString(fmt.Sprintf("   Docstring: %s\n", strings.ReplaceAll(docstring, "\n", "\n   ")))
+			}
+
+			// Fetch neighboring classes/methods/modules
+			neighbors, _ := gdb.GetNeighbors(res.ID)
+			if len(neighbors) > 0 {
+				var nList []string
+				for _, n := range neighbors {
+					nList = append(nList, fmt.Sprintf("%s (%s)", n["name"], n["type"]))
+				}
+				sb.WriteString(fmt.Sprintf("   Neighbors: %s\n", strings.Join(nList, ", ")))
+			}
+
+			if code != "" {
+				sb.WriteString(fmt.Sprintf("   [Code omitted for progressive disclosure. Use m_cpg_read_node with fqn '%s' to read full code]\n", fqn))
+			}
+			sb.WriteString("--------------------------------------------------\n")
 		}
-		sb.WriteString("--------------------------------------------------\n\n")
+		sb.WriteString("\n")
+	}
+
+	// 3. Search Memory Events (The kb_search aspect)
+	// We use the topK for memory events as well
+	memResult, _ := RunSearchMemory(query, topK, gdb, cfg)
+	if memResult != "No active memories found matching the query." {
+		sb.WriteString("## Episodic / Semantic Memories:\n")
+		// Strip the "Found X memories matching 'query':\n\n" header from RunSearchMemory output
+		lines := strings.Split(memResult, "\n")
+		if len(lines) > 2 {
+			sb.WriteString(strings.Join(lines[2:], "\n"))
+		}
+	}
+
+	if sb.Len() <= len(fmt.Sprintf("Hybrid Search Results for query: '%s'\n==================================================\n\n", query)) {
+		return fmt.Sprintf("No relevant code or event memory found for query: '%s'", query), nil
 	}
 
 	return sb.String(), nil
@@ -1055,7 +1104,7 @@ func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Confi
 }
 
 // RunRemember saves a developer preference, compilation fix, or session log to the DB and generates vector embedding.
-func RunRemember(summary, details, eventType string, gdb *db.GraphDB, cfg *config.Config) error {
+func RunRemember(summary, details, eventType string, importance int, gdb *db.GraphDB, cfg *config.Config) error {
 	id := uuid.New().String()
 	timestamp := time.Now().Unix()
 
@@ -1073,7 +1122,7 @@ func RunRemember(summary, details, eventType string, gdb *db.GraphDB, cfg *confi
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
-	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active")
+	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active", importance)
 	if err != nil {
 		return fmt.Errorf("failed to save memory to DB: %w", err)
 	}
@@ -1107,6 +1156,61 @@ func RunGetConceptHierarchy(limit int, gdb *db.GraphDB) (string, error) {
 		name := c["name"].(string)
 		frequency := c["frequency"].(int)
 		sb.WriteString(fmt.Sprintf("%d. %s (Frequency: %d)\n", i+1, name, frequency))
+	}
+
+	return sb.String(), nil
+}
+
+// RunGetHotContext queries the most recent 5 active events and top 5 concepts to generate a dynamic hot context index
+func RunGetHotContext(gdb *db.GraphDB) (string, error) {
+	events, err := gdb.GetRecentActiveEvents(5)
+	if err != nil {
+		return "", err
+	}
+
+	concepts, err := gdb.GetTopConcepts(5)
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# AI Agent Hot Context (Dynamic Index)\n\n")
+
+	sb.WriteString("## Active Entities / Concepts\n")
+	if len(concepts) > 0 {
+		for _, c := range concepts {
+			name := c["name"].(string)
+			frequency := c["frequency"].(int)
+			sb.WriteString(fmt.Sprintf("- **%s** (Freq: %d)\n", name, frequency))
+		}
+	} else {
+		sb.WriteString("No active concepts found.\n")
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("## Current Tasks / Unresolved Issues\n")
+	if len(events) > 0 {
+		for i, ev := range events {
+			t := time.Unix(ev["timestamp"].(int64), 0).Format("2006-01-02 15:04:05")
+
+			// Render fire emoji for high importance events
+			importanceLabel := ""
+			if imp, ok := ev["importance"].(int); ok && imp >= 5 {
+				importanceLabel = " 🔥"
+			} else if imp, ok := ev["importance"].(int64); ok && imp >= 5 {
+				importanceLabel = " 🔥"
+			}
+
+			sb.WriteString(fmt.Sprintf("%d. **[%s]** %s (%s)%s\n", i+1, ev["event_type"], ev["summary"], t, importanceLabel))
+			if details := ev["details"].(string); details != "" {
+				lines := strings.Split(details, "\n")
+				for _, line := range lines {
+					sb.WriteString(fmt.Sprintf("   > %s\n", line))
+				}
+			}
+		}
+	} else {
+		sb.WriteString("No unresolved tasks found.\n")
 	}
 
 	return sb.String(), nil

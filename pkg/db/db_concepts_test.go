@@ -16,7 +16,7 @@ func TestConceptOperations(t *testing.T) {
 	defer g.Close()
 
 	// Add event
-	err = g.SaveEvent(nil, "evt1", "test", "summary1", "details1", 12345, []byte{0, 1}, "active")
+	err = g.SaveEvent(nil, "evt1", "test", "summary1", "details1", 12345, []byte{0, 1}, "active", 0)
 	if err != nil {
 		t.Fatalf("Failed to save event: %v", err)
 	}
