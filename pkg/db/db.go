@@ -173,6 +173,12 @@ func (g *GraphDB) ensureSchema() error {
 		fmt.Printf("[DB] Note: Could not alter events table importance column: %v\n", alterErrImp)
 	}
 
+	alterEventsTableAcc := `ALTER TABLE events ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0;`
+	_, alterErrAcc := g.db.Exec(alterEventsTableAcc)
+	if alterErrAcc != nil && !strings.Contains(alterErrAcc.Error(), "duplicate column name") {
+		fmt.Printf("[DB] Note: Could not alter events table last_accessed column: %v\n", alterErrAcc)
+	}
+
 	// Create concepts table
 	createConceptsTable := `
 	CREATE TABLE IF NOT EXISTS concepts (
@@ -620,21 +626,123 @@ func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 // SaveEvent inserts a new event (preference, error fix, session log) in the database
 func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int) error {
 	query := `
-	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status, importance)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance)
+	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance, timestamp)
 	if err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
 	return nil
 }
 
+// UpdateEventAccess updates the last_accessed timestamp for given event IDs
+func (g *GraphDB) UpdateEventAccess(tx *sql.Tx, ids []string, timestamp int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, timestamp)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(`UPDATE events SET last_accessed = ? WHERE id IN (%s);`, strings.Join(placeholders, ","))
+	executor := g.getExecutor(tx)
+
+	if _, err := executor.Exec(query, args...); err != nil {
+		return fmt.Errorf("failed to batch update last_accessed: %w", err)
+	}
+	return nil
+}
+
+// RunTieringGC scans active events and reduces importance for those not accessed recently.
+// If importance drops below 0, they are archived.
+func (g *GraphDB) RunTieringGC(decayIntervalSeconds int64, currentTime int64) error {
+	return g.RunInTransaction(func(tx *sql.Tx) error {
+		// Find events that haven't been accessed within the decay interval
+		cutoffTime := currentTime - decayIntervalSeconds
+
+		query := `
+		SELECT id, importance
+		FROM events
+		WHERE status = 'active' AND last_accessed < ?;
+		`
+
+		rows, err := tx.Query(query, cutoffTime)
+		if err != nil {
+			return fmt.Errorf("failed to query stale events: %w", err)
+		}
+
+		type eventUpdate struct {
+			id string
+			newImportance int
+		}
+		var toUpdate []eventUpdate
+
+		for rows.Next() {
+			var id string
+			var importance int
+			if err := rows.Scan(&id, &importance); err != nil {
+				continue
+			}
+			toUpdate = append(toUpdate, eventUpdate{id: id, newImportance: importance - 1})
+		}
+		rows.Close()
+
+		if len(toUpdate) == 0 {
+			return nil
+		}
+
+		// Process updates
+		var toArchive []string
+
+		updateImportanceQuery := `UPDATE events SET importance = ?, last_accessed = ? WHERE id = ?;`
+		stmt, err := tx.Prepare(updateImportanceQuery)
+		if err != nil {
+			return fmt.Errorf("failed to prepare update statement: %w", err)
+		}
+		defer stmt.Close()
+
+		for _, eu := range toUpdate {
+			if eu.newImportance < 0 {
+				toArchive = append(toArchive, eu.id)
+			} else {
+				// Update importance and reset last_accessed so it doesn't decay again immediately
+				if _, err := stmt.Exec(eu.newImportance, currentTime, eu.id); err != nil {
+					return fmt.Errorf("failed to update event importance: %w", err)
+				}
+			}
+		}
+
+		if len(toArchive) > 0 {
+			// Reuse the ArchiveEvents method logic directly within this transaction
+			placeholders := make([]string, len(toArchive))
+			args := make([]any, len(toArchive))
+			for i, id := range toArchive {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+
+			archiveQuery := fmt.Sprintf(`UPDATE events SET status = 'archived' WHERE id IN (%s);`, strings.Join(placeholders, ","))
+			if _, err := tx.Exec(archiveQuery, args...); err != nil {
+				return fmt.Errorf("failed to batch archive events during GC: %w", err)
+			}
+			fmt.Printf("[DB] Tiering GC archived %d stale events.\n", len(toArchive))
+		}
+
+		return nil
+	})
+}
+
 // GetAllActiveEvents retrieves all events where status = 'active'
 func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
 	query := `
-	SELECT id, timestamp, event_type, summary, details, embedding, status, importance
+	SELECT id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed
 	FROM events
 	WHERE status = 'active'
 	ORDER BY importance DESC, timestamp DESC;
@@ -648,21 +756,22 @@ func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
 	var events []map[string]any
 	for rows.Next() {
 		var id, eventType, summary, details, status string
-		var timestamp int64
+		var timestamp, lastAccessed int64
 		var embedding []byte
 		var importance int
-		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &status, &importance); err != nil {
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &status, &importance, &lastAccessed); err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
 		events = append(events, map[string]any{
-			"id":         id,
-			"timestamp":  timestamp,
-			"event_type": eventType,
-			"summary":    summary,
-			"details":    details,
-			"embedding":  embedding,
-			"status":     status,
-			"importance": importance,
+			"id":            id,
+			"timestamp":     timestamp,
+			"event_type":    eventType,
+			"summary":       summary,
+			"details":       details,
+			"embedding":     embedding,
+			"status":        status,
+			"importance":    importance,
+			"last_accessed": lastAccessed,
 		})
 	}
 	return events, nil
@@ -695,7 +804,7 @@ func (g *GraphDB) ArchiveEvents(tx *sql.Tx, ids []string) error {
 // GetRecentActiveEvents retrieves the most recent active events from the database
 func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 	query := `
-	SELECT id, timestamp, event_type, summary, details, embedding, importance
+	SELECT id, timestamp, event_type, summary, details, embedding, importance, last_accessed
 	FROM events
 	WHERE status = 'active'
 	ORDER BY importance DESC, timestamp DESC
@@ -710,21 +819,22 @@ func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 	var events []map[string]any
 	for rows.Next() {
 		var id, eventType, summary, details string
-		var timestamp int64
+		var timestamp, lastAccessed int64
 		var embedding []byte
 		var importance int
-		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &importance); err != nil {
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &importance, &lastAccessed); err != nil {
 			return nil, err
 		}
 
 		events = append(events, map[string]any{
-			"id":         id,
-			"timestamp":  timestamp,
-			"event_type": eventType,
-			"summary":    summary,
-			"details":    details,
-			"embedding":  embedding,
-			"importance": importance,
+			"id":            id,
+			"timestamp":     timestamp,
+			"event_type":    eventType,
+			"summary":       summary,
+			"details":       details,
+			"embedding":     embedding,
+			"importance":    importance,
+			"last_accessed": lastAccessed,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -736,7 +846,7 @@ func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 // GetRecentEvents retrieves the most recent events from the database
 func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 	query := `
-	SELECT id, timestamp, event_type, summary, details, embedding, importance
+	SELECT id, timestamp, event_type, summary, details, embedding, importance, last_accessed
 	FROM events
 	ORDER BY importance DESC, timestamp DESC
 	LIMIT ?;
@@ -750,21 +860,22 @@ func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 	var events []map[string]any
 	for rows.Next() {
 		var id, eventType, summary, details string
-		var timestamp int64
+		var timestamp, lastAccessed int64
 		var embedding []byte
 		var importance int
-		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &importance); err != nil {
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &importance, &lastAccessed); err != nil {
 			return nil, err
 		}
 
 		events = append(events, map[string]any{
-			"id":         id,
-			"timestamp":  timestamp,
-			"event_type": eventType,
-			"summary":    summary,
-			"details":    details,
-			"embedding":  embedding,
-			"importance": importance,
+			"id":            id,
+			"timestamp":     timestamp,
+			"event_type":    eventType,
+			"summary":       summary,
+			"details":       details,
+			"embedding":     embedding,
+			"importance":    importance,
+			"last_accessed": lastAccessed,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -840,4 +951,162 @@ func (g *GraphDB) GetTopConcepts(limit int) ([]map[string]any, error) {
 
 func (g *GraphDB) Close() error {
 	return g.db.Close()
+}
+
+// QueryPattern parses a simple DSL like `Method(A) -> CALLS -> Method(B)` and executes the query
+// It uses a Recursive CTE to traverse multiple hops if maxDepth > 1, falling back to a direct JOIN for single hop queries.
+func (g *GraphDB) QueryPattern(pattern string, maxDepth int) ([]map[string]any, error) {
+	// Simple parsing
+	// Format: Node(Type) -> EdgeLabel -> Node(Type)
+	// Example: Method(*) -> CALLS -> Method(*)
+	// Example: Class(User) -> CONTAINS -> Method(*)
+
+	pattern = strings.TrimSpace(pattern)
+
+	parts := strings.Split(pattern, "->")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid pattern format, expected Node(Type) -> LABEL -> Node(Type)")
+	}
+
+	sourceStr := strings.TrimSpace(parts[0])
+	edgeStr := strings.TrimSpace(parts[1])
+	targetStr := strings.TrimSpace(parts[2])
+
+	parseNode := func(s string) (string, string) {
+		s = strings.TrimSuffix(s, ")")
+		parts := strings.SplitN(s, "(", 2)
+		if len(parts) != 2 {
+			return "", ""
+		}
+		return parts[0], parts[1]
+	}
+
+	srcType, srcName := parseNode(sourceStr)
+	targetType, targetName := parseNode(targetStr)
+
+	if srcType == "" || targetType == "" {
+		return nil, fmt.Errorf("invalid node format, expected NodeType(Name)")
+	}
+
+	var args []any
+
+	// Create conditions for source node
+	srcConds := []string{"1=1"}
+	if srcType != "*" && srcType != "" {
+		srcConds = append(srcConds, "type = ?")
+		args = append(args, srcType)
+	}
+	if srcName != "*" && srcName != "" {
+		srcConds = append(srcConds, "name LIKE ?")
+		args = append(args, "%"+srcName+"%")
+	}
+
+	// Base edge condition for recursion
+	edgeConds := []string{"1=1"}
+	if edgeStr != "*" && edgeStr != "" {
+		edgeConds = append(edgeConds, "label = ?")
+		args = append(args, edgeStr)
+	}
+
+	// Target node condition at end of path
+	tgtConds := []string{"1=1"}
+	if targetType != "*" && targetType != "" {
+		tgtConds = append(tgtConds, "n.type = ?")
+		args = append(args, targetType)
+	}
+	if targetName != "*" && targetName != "" {
+		tgtConds = append(tgtConds, "n.name LIKE ?")
+		args = append(args, "%"+targetName+"%")
+	}
+
+	// Make sure we pass depth parameter
+	args = append(args, maxDepth)
+
+	query := fmt.Sprintf(`
+	WITH RECURSIVE
+	search_graph(source_id, source_type, source_name, source_fqn,
+				 edge_label, edge_properties,
+				 target_id, depth, path) AS (
+		SELECT
+			n1.id, n1.type, n1.name, n1.fqn,
+			e.label, e.properties,
+			e.target, 1, n1.id || '->' || e.target
+		FROM edges e
+		JOIN nodes n1 ON e.source = n1.id
+		WHERE (%s) AND (%s)
+
+		UNION ALL
+
+		SELECT
+			sg.source_id, sg.source_type, sg.source_name, sg.source_fqn,
+			e.label, e.properties,
+			e.target, sg.depth + 1, sg.path || '->' || e.target
+		FROM edges e
+		JOIN search_graph sg ON e.source = sg.target_id
+		WHERE sg.depth < ?
+		  AND (%s)
+		  AND instr('->' || sg.path || '->', '->' || e.target || '->') = 0
+	)
+	SELECT
+		sg.source_id, sg.source_type, sg.source_name, sg.source_fqn,
+		sg.edge_label, sg.edge_properties,
+		n.id, n.type, n.name, n.fqn, sg.depth
+	FROM search_graph sg
+	JOIN nodes n ON sg.target_id = n.id
+	WHERE (%s)
+	ORDER BY sg.depth, sg.source_id, n.id LIMIT 100
+	`, strings.Join(srcConds, " AND "), strings.Join(edgeConds, " AND "), strings.Join(edgeConds, " AND "), strings.Join(tgtConds, " AND "))
+
+	// Duplicate the edge condition arguments for the UNION ALL part
+	var expandedArgs []any
+	if srcType != "*" && srcType != "" {
+		expandedArgs = append(expandedArgs, srcType)
+	}
+	if srcName != "*" && srcName != "" {
+		expandedArgs = append(expandedArgs, "%"+srcName+"%")
+	}
+	if edgeStr != "*" && edgeStr != "" {
+		expandedArgs = append(expandedArgs, edgeStr)
+	}
+	expandedArgs = append(expandedArgs, maxDepth)
+	if edgeStr != "*" && edgeStr != "" {
+		expandedArgs = append(expandedArgs, edgeStr)
+	}
+	if targetType != "*" && targetType != "" {
+		expandedArgs = append(expandedArgs, targetType)
+	}
+	if targetName != "*" && targetName != "" {
+		expandedArgs = append(expandedArgs, "%"+targetName+"%")
+	}
+
+	rows, err := g.db.Query(query, expandedArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pattern: %w", err)
+	}
+	defer rows.Close()
+
+	var results []map[string]any
+	for rows.Next() {
+		var srcId, srcType, srcName, srcFqn, edgeLabel, edgeProps, targetId, targetType, targetName, targetFqn string
+		var depth int
+		if err := rows.Scan(&srcId, &srcType, &srcName, &srcFqn, &edgeLabel, &edgeProps, &targetId, &targetType, &targetName, &targetFqn, &depth); err != nil {
+			return nil, err
+		}
+
+		res := map[string]any{
+			"source": map[string]any{
+				"id": srcId, "type": srcType, "name": srcName, "fqn": srcFqn,
+			},
+			"edge": map[string]any{
+				"label": edgeLabel, "properties": edgeProps,
+			},
+			"target": map[string]any{
+				"id": targetId, "type": targetType, "name": targetName, "fqn": targetFqn,
+			},
+			"depth": depth,
+		}
+		results = append(results, res)
+	}
+
+	return results, nil
 }

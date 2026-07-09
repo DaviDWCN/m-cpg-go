@@ -71,6 +71,19 @@ func StartServer(gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config
 		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to load vectors from DB: %v\n", err)
 	}
 
+	// Start Tiering GC background worker
+	go func() {
+		fmt.Fprintln(os.Stderr, "[MCP] Starting background Tiering GC worker...")
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			// Decay interval: 7 days = 7 * 24 * 60 * 60 = 604800 seconds
+			if err := gdb.RunTieringGC(604800, time.Now().Unix()); err != nil {
+				fmt.Fprintf(os.Stderr, "[MCP] Tiering GC Error: %v\n", err)
+			}
+		}
+	}()
+
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		line, err := reader.ReadString('\n')
@@ -896,11 +909,16 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 				var err error
 				if insertedNodeIDs[rel.Source] && insertedNodeIDs[rel.Target] {
 					// Fast path: both nodes exist, execute direct insert
-					query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, '{}');`
-					_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label)
+					propsJSON := "{}"
+					if len(rel.Properties) > 0 {
+						data, _ := json.Marshal(rel.Properties)
+						propsJSON = string(data)
+					}
+					query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, ?);`
+					_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label, propsJSON)
 				} else {
 					// Fallback path: one of the nodes might be external
-					err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, nil)
+					err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, rel.Properties)
 				}
 				if err != nil {
 					return fmt.Errorf("failed to save edge: %w", err)
@@ -1230,6 +1248,19 @@ func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Confi
 
 	if len(topEvents) == 0 {
 		return "No active memories found matching the query.", nil
+	}
+
+	// Update last_accessed for the retrieved events
+	var topEventIDs []string
+	for _, se := range topEvents {
+		if id, ok := se.Event["id"].(string); ok {
+			topEventIDs = append(topEventIDs, id)
+		}
+	}
+	if len(topEventIDs) > 0 {
+		if err := gdb.UpdateEventAccess(nil, topEventIDs, time.Now().Unix()); err != nil {
+			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to update event access times: %v\n", err)
+		}
 	}
 
 	var sb strings.Builder

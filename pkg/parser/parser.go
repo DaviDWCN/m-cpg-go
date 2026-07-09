@@ -17,9 +17,10 @@ type CodeEntity struct {
 }
 
 type CodeRelation struct {
-	Source string
-	Target string
-	Label  string // "CONTAINS", "CALLS"
+	Source     string
+	Target     string
+	Label      string         // "CONTAINS", "CALLS"
+	Properties map[string]any // Used for things like weights
 }
 
 // DeriveFQN extracts the package/module name based on the file path relative to the source directory
@@ -53,7 +54,57 @@ func ParseFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelation
 		return ParseGoFile(filePath, projectID, srcDir)
 	case ".md":
 		return ParseMarkdownFile(filePath, projectID, srcDir)
+	case ".ts", ".tsx", ".js", ".jsx":
+		return ParseTSFile(filePath, projectID, srcDir)
 	default:
 		return nil, nil, fmt.Errorf("unsupported file extension: %s", ext)
 	}
+}
+
+// AggregateRelations groups relations by Source, Target, and Label, summing their weights
+func AggregateRelations(relations []CodeRelation) []CodeRelation {
+	type key struct {
+		Source string
+		Target string
+		Label  string
+	}
+
+	agg := make(map[key]*CodeRelation)
+	var orderedKeys []key
+
+	for _, rel := range relations {
+		k := key{Source: rel.Source, Target: rel.Target, Label: rel.Label}
+		if existing, found := agg[k]; found {
+			// Increment weight if both are CALLS or if it already has a weight
+			if rel.Label == "CALLS" {
+				var w int = 1
+				if existing.Properties != nil && existing.Properties["weight"] != nil {
+					if currentW, ok := existing.Properties["weight"].(int); ok {
+						w = currentW + 1
+					}
+				}
+				if existing.Properties == nil {
+					existing.Properties = make(map[string]any)
+				}
+				existing.Properties["weight"] = w
+			}
+		} else {
+			orderedKeys = append(orderedKeys, k)
+			newRel := rel
+			if newRel.Label == "CALLS" {
+				if newRel.Properties == nil {
+					newRel.Properties = make(map[string]any)
+				}
+				newRel.Properties["weight"] = 1
+			}
+			agg[k] = &newRel
+		}
+	}
+
+	var result []CodeRelation
+	for _, k := range orderedKeys {
+		result = append(result, *agg[k])
+	}
+
+	return result
 }
