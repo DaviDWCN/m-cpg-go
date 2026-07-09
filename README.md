@@ -39,3 +39,30 @@ Once built, you can run the executable directly from the root of the repository:
 # Perform a hybrid vector/graph search on the database
 ./m-cpg-go search "your query here"
 ```
+
+## Per-Project Database Isolation (MCP Configuration)
+
+By default, `m-cpg-go` creates its SQLite database (`m_cpg.db`) in the current working directory where the server is started. If you use a global configuration (e.g., in Claude Desktop or a global IDE setting), all your projects might end up sharing a single, global database file.
+
+To achieve **physical isolation** so that each project gets its own independent database, we highly recommend using **workspace-specific (local) MCP configurations** in your AI IDEs (like Cursor, Windsurf, or Cline) rather than a global one.
+
+When configured locally, the IDE launches the MCP server from the root of your project directory, ensuring `m_cpg.db` is created safely inside that specific project.
+
+### Example: Cursor Configuration
+Create a `.cursor/mcp.json` file in the root of your project:
+
+```json
+{
+  "mcpServers": {
+    "m-cpg": {
+      "command": "m-cpg-go",
+      "args": ["mcp"],
+      "env": {
+        "M_CPG_DB_PATH": "./.m-cpg/m_cpg.db"
+      }
+    }
+  }
+}
+```
+
+*Note: In this example, we set `M_CPG_DB_PATH` to `./.m-cpg/m_cpg.db`. You should add `.m-cpg/` to your project's `.gitignore` to avoid tracking the database file in your version control system.*
