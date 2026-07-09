@@ -155,7 +155,13 @@ func (g *GraphDB) ensureSchema() error {
 	if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
 		// Only log or ignore, do not fail completely if it's already there or something similar.
 		// A fatal failure would prevent the app from starting.
-		fmt.Printf("[DB] Note: Could not alter events table (might already exist): %v\n", alterErr)
+		fmt.Printf("[DB] Note: Could not alter events table status column: %v\n", alterErr)
+	}
+
+	alterEventsTableImp := `ALTER TABLE events ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;`
+	_, alterErrImp := g.db.Exec(alterEventsTableImp)
+	if alterErrImp != nil && !strings.Contains(alterErrImp.Error(), "duplicate column name") {
+		fmt.Printf("[DB] Note: Could not alter events table importance column: %v\n", alterErrImp)
 	}
 
 	// Create concepts table
@@ -549,13 +555,13 @@ func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 }
 
 // SaveEvent inserts a new event (preference, error fix, session log) in the database
-func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string) error {
+func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int) error {
 	query := `
-	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status)
-	VALUES (?, ?, ?, ?, ?, ?, ?);
+	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status, importance)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status)
+	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance)
 	if err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
@@ -565,10 +571,10 @@ func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, 
 // GetAllActiveEvents retrieves all events where status = 'active'
 func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
 	query := `
-	SELECT id, timestamp, event_type, summary, details, embedding, status
+	SELECT id, timestamp, event_type, summary, details, embedding, status, importance
 	FROM events
 	WHERE status = 'active'
-	ORDER BY timestamp DESC;
+	ORDER BY importance DESC, timestamp DESC;
 	`
 	rows, err := g.db.Query(query)
 	if err != nil {
@@ -581,7 +587,8 @@ func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
 		var id, eventType, summary, details, status string
 		var timestamp int64
 		var embedding []byte
-		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &status); err != nil {
+		var importance int
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &status, &importance); err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
 		events = append(events, map[string]any{
@@ -592,6 +599,7 @@ func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
 			"details":    details,
 			"embedding":  embedding,
 			"status":     status,
+			"importance": importance,
 		})
 	}
 	return events, nil
@@ -624,10 +632,10 @@ func (g *GraphDB) ArchiveEvents(tx *sql.Tx, ids []string) error {
 // GetRecentActiveEvents retrieves the most recent active events from the database
 func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 	query := `
-	SELECT id, timestamp, event_type, summary, details, embedding
+	SELECT id, timestamp, event_type, summary, details, embedding, importance
 	FROM events
 	WHERE status = 'active'
-	ORDER BY timestamp DESC
+	ORDER BY importance DESC, timestamp DESC
 	LIMIT ?;
 	`
 	rows, err := g.db.Query(query, limit)
@@ -641,7 +649,8 @@ func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 		var id, eventType, summary, details string
 		var timestamp int64
 		var embedding []byte
-		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding); err != nil {
+		var importance int
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &importance); err != nil {
 			return nil, err
 		}
 
@@ -652,6 +661,7 @@ func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 			"summary":    summary,
 			"details":    details,
 			"embedding":  embedding,
+			"importance": importance,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -663,9 +673,9 @@ func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 // GetRecentEvents retrieves the most recent events from the database
 func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 	query := `
-	SELECT id, timestamp, event_type, summary, details, embedding
+	SELECT id, timestamp, event_type, summary, details, embedding, importance
 	FROM events
-	ORDER BY timestamp DESC
+	ORDER BY importance DESC, timestamp DESC
 	LIMIT ?;
 	`
 	rows, err := g.db.Query(query, limit)
@@ -679,7 +689,8 @@ func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 		var id, eventType, summary, details string
 		var timestamp int64
 		var embedding []byte
-		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding); err != nil {
+		var importance int
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &importance); err != nil {
 			return nil, err
 		}
 
@@ -690,6 +701,7 @@ func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 			"summary":    summary,
 			"details":    details,
 			"embedding":  embedding,
+			"importance": importance,
 		})
 	}
 	if err := rows.Err(); err != nil {
