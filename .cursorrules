@@ -19,6 +19,12 @@ Before writing any new function, method, class, struct, or utility helper:
 4. **If no duplicates:** proceed to write the new function.
 5. **If duplicates found:** you MUST NOT create a new function. Instead, import and refactor/extend the existing function found by the tool.
 
+## 1.2 Prevent Breaking Changes via GraphRAG (Multi-hop Logic)
+Before modifying an existing function or method:
+- **Rule 1.2**: You MUST call the MCP tool `m_cpg_get_node_dependencies` with the target node's `fqn`.
+- Review the `Callers` (methods that depend on this node) to understand the blast radius of your change.
+- If your change alters the method's behavior or signature, you are responsible for checking and updating all listed `Callers` to prevent breaking the application.
+
 ## 1.5 Session Bootstrap Hook
 - **Rule 3**: At the very beginning of every new session or chat, you MUST automatically call the `m_cpg_kb_bootstrap` tool to load the Hot Context layer and seed your system prompt / initial context with active project tasks and entities.
 

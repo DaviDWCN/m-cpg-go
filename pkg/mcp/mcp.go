@@ -402,6 +402,47 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Required:   []string{},
 				},
 			},
+			{
+				Name:        "m_cpg_query_graph",
+				Description: "Executes a structural multi-hop pattern query on the code graph (e.g., 'Method(A) -> CALLS -> Method(B)'). Useful for finding relationships like 'What does ClassX contain?' or 'What calls MethodY?'. Use '*' as a wildcard for names.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"pattern": map[string]string{
+							"type":        "string",
+							"description": "The query pattern, e.g., 'Class(MyClass) -> CONTAINS -> Method(*)' or 'Method(*) -> CALLS -> Method(TargetFunc)'.",
+						},
+						"max_depth": map[string]interface{}{
+							"type":        "integer",
+							"description": "Maximum depth for recursive traversal (default 1).",
+							"default":     1,
+						},
+					},
+					Required: []string{"pattern"},
+				},
+			},
+			{
+				Name:        "m_cpg_get_node_dependencies",
+				Description: "Retrieves the structural dependencies for a node (Callers and Callees) using its FQN. Useful for determining the impact of changing a method.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"fqn": map[string]string{
+							"type":        "string",
+							"description": "The Fully Qualified Name (FQN) of the node (e.g., pkg.module.ClassName.MethodName).",
+						},
+					},
+					Required: []string{"fqn"},
+				},
+			},
 		}
 
 		sendSuccessResponse(req.ID, map[string]interface{}{
@@ -699,6 +740,47 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get concept hierarchy: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_query_graph":
+		var params struct {
+			Pattern  string `json:"pattern"`
+			MaxDepth *int   `json:"max_depth,omitempty"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+		maxDepth := 1
+		if params.MaxDepth != nil && *params.MaxDepth > 0 {
+			maxDepth = *params.MaxDepth
+		}
+
+		res, err := RunQueryGraph(params.Pattern, maxDepth, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to query graph: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_get_node_dependencies":
+		var params struct {
+			Fqn string `json:"fqn"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+
+		res, err := RunGetNodeDependencies(params.Fqn, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get node dependencies: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -1583,4 +1665,110 @@ func RunReadNode(fqn string, gdb *db.GraphDB) (string, error) {
 	}
 
 	return fmt.Sprintf("Node with FQN '%s' not found.", fqn), nil
+}
+
+// RunQueryGraph executes a structural query pattern (e.g. Method(A) -> CALLS -> Method(B)) on the graph database.
+func RunQueryGraph(pattern string, maxDepth int, gdb *db.GraphDB) (string, error) {
+	results, err := gdb.QueryPattern(pattern, maxDepth)
+	if err != nil {
+		return "", err
+	}
+
+	if len(results) == 0 {
+		return fmt.Sprintf("No results found for pattern: '%s' (max_depth: %d)", pattern, maxDepth), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Graph Query Results for pattern: '%s' (max_depth: %d)\n", pattern, maxDepth))
+	sb.WriteString("==================================================\n\n")
+
+	for i, res := range results {
+		id, _ := res["id"].(string)
+		nodeType, _ := res["type"].(string)
+		name, _ := res["name"].(string)
+		fqn, _ := res["fqn"].(string)
+
+		// The generic QueryPattern usually returns matched nodes, we can display them
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s (FQN: %s)\n", i+1, nodeType, name, fqn))
+		sb.WriteString(fmt.Sprintf("   [Code omitted. Use m_cpg_read_node with fqn '%s' to read full code]\n", fqn))
+		sb.WriteString(fmt.Sprintf("   Node ID: %s\n", id))
+		sb.WriteString("--------------------------------------------------\n")
+	}
+
+	return sb.String(), nil
+}
+
+// RunGetNodeDependencies fetches the callers and callees of a specific node given its FQN
+func RunGetNodeDependencies(fqn string, gdb *db.GraphDB) (string, error) {
+	nodes, err := gdb.QueryNodes("", fqn, "")
+	if err != nil {
+		return "", err
+	}
+
+	var targetNodeID string
+	var targetNodeType string
+	for _, node := range nodes {
+		nodeFQN, ok := node["fqn"].(string)
+		if ok && nodeFQN == fqn {
+			targetNodeID = node["id"].(string)
+			targetNodeType = node["type"].(string)
+			break
+		}
+	}
+
+	if targetNodeID == "" {
+		return fmt.Sprintf("Node with FQN '%s' not found.", fqn), nil
+	}
+
+	// Now we fetch callers (nodes that CALL targetNodeID)
+	// and callees (nodes that targetNodeID CALLS)
+	// We can use gdb.QueryPattern but that doesn't explicitly group by direction easily
+	// unless we do two queries.
+
+	callers, err := gdb.QueryPattern(fmt.Sprintf("*(*) -> CALLS -> %s(%s)", targetNodeType, targetNodeID), 1)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch callers: %v", err)
+	}
+
+	callees, err := gdb.QueryPattern(fmt.Sprintf("%s(%s) -> CALLS -> *(*)", targetNodeType, targetNodeID), 1)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch callees: %v", err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Dependencies for Node [%s] %s:\n", targetNodeType, fqn))
+	sb.WriteString("==================================================\n\n")
+
+	sb.WriteString("### Callers (Methods/Functions that call this node):\n")
+	if len(callers) == 0 {
+		sb.WriteString("  - None found.\n")
+	} else {
+		for _, c := range callers {
+			cNodeType, _ := c["type"].(string)
+			cName, _ := c["name"].(string)
+			cFQN, _ := c["fqn"].(string)
+			if cFQN == fqn {
+				continue // Skip self if QueryPattern returned it
+			}
+			sb.WriteString(fmt.Sprintf("  - [%s] %s (FQN: %s)\n", cNodeType, cName, cFQN))
+		}
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("### Callees (Methods/Functions called by this node):\n")
+	if len(callees) == 0 {
+		sb.WriteString("  - None found.\n")
+	} else {
+		for _, c := range callees {
+			cNodeType, _ := c["type"].(string)
+			cName, _ := c["name"].(string)
+			cFQN, _ := c["fqn"].(string)
+			if cFQN == fqn {
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("  - [%s] %s (FQN: %s)\n", cNodeType, cName, cFQN))
+		}
+	}
+
+	return sb.String(), nil
 }
