@@ -25,9 +25,9 @@ type embedResponse struct {
 }
 
 // GetEmbedding fetches the embedding vector from Ollama/OpenAI or falls back to pseudo-embeddings
-func GetEmbedding(text, provider, model, endpoint, apiKey string) ([]float32, error) {
+func GetEmbedding(text, provider, model, endpoint, apiKey string, dimension int) ([]float32, error) {
 	if provider == "" || provider == "mock" {
-		return GeneratePseudoEmbedding(text), nil
+		return GeneratePseudoEmbedding(text, dimension), nil
 	}
 
 	// Prepare JSON payload
@@ -55,14 +55,14 @@ func GetEmbedding(text, provider, model, endpoint, apiKey string) ([]float32, er
 	if err != nil {
 		// Log warning to stderr and fallback to pseudo-embedding
 		fmt.Fprintf(os.Stderr, "[Warning] Embedding API call failed: %v. Falling back to pseudo-embedding.\n", err)
-		return GeneratePseudoEmbedding(text), nil
+		return GeneratePseudoEmbedding(text, dimension), nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "[Warning] Embedding API returned status %d: %s. Falling back to pseudo-embedding.\n", resp.StatusCode, string(bodyBytes))
-		return GeneratePseudoEmbedding(text), nil
+		return GeneratePseudoEmbedding(text, dimension), nil
 	}
 
 	var res embedResponse
@@ -79,8 +79,10 @@ func GetEmbedding(text, provider, model, endpoint, apiKey string) ([]float32, er
 
 // GeneratePseudoEmbedding creates a feature-hashing based TF-BoW 768-dimensional float32 vector based on text content.
 // This preserves some semantic similarity when external APIs fail.
-func GeneratePseudoEmbedding(text string) []float32 {
-	dims := 768
+func GeneratePseudoEmbedding(text string, dims int) []float32 {
+	if dims <= 0 {
+		dims = 768
+	}
 	vec := make([]float32, dims)
 
 	// Basic tokenization

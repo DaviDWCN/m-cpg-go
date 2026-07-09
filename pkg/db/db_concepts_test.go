@@ -11,7 +11,7 @@ func TestConceptOperations(t *testing.T) {
 	dbPath := "test_concepts.db"
 	defer os.Remove(dbPath)
 
-	g, err := InitDB(dbPath)
+	g, err := InitDB(dbPath, 768)
 	if err != nil {
 		t.Fatalf("Failed to init DB: %v", err)
 	}

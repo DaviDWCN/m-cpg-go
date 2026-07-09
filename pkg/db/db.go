@@ -57,7 +57,7 @@ func (g *GraphDB) RunInTransaction(fn func(tx *sql.Tx) error) error {
 }
 
 // InitDB initializes the SQLite database, creates schema, and returns GraphDB instance
-func InitDB(dbPath string) (*GraphDB, error) {
+func InitDB(dbPath string, vectorDim int) (*GraphDB, error) {
 	// Ensure parent directory exists
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -71,7 +71,7 @@ func InitDB(dbPath string) (*GraphDB, error) {
 	}
 
 	gdb := &GraphDB{db: db}
-	if err := gdb.ensureSchema(); err != nil {
+	if err := gdb.ensureSchema(vectorDim); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -79,7 +79,7 @@ func InitDB(dbPath string) (*GraphDB, error) {
 	return gdb, nil
 }
 
-func (g *GraphDB) ensureSchema() error {
+func (g *GraphDB) ensureSchema(vectorDim int) error {
 	// Enable WAL mode and other optimizations for concurrency and performance
 	pragmas := []string{
 		"PRAGMA foreign_keys=ON;",
@@ -127,7 +127,7 @@ func (g *GraphDB) ensureSchema() error {
 	}
 
 	// Create vectors table
-	createVectorsTable := `CREATE VIRTUAL TABLE IF NOT EXISTS vectors USING vec0(embedding float[768]);`
+	createVectorsTable := fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors USING vec0(embedding float[%d]);`, vectorDim)
 	createVectorsMetaTable := `CREATE TABLE IF NOT EXISTS vectors_meta (
 		rowid INTEGER PRIMARY KEY,
 		node_id TEXT UNIQUE NOT NULL,

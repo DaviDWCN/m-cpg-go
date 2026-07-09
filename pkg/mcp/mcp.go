@@ -66,11 +66,6 @@ type mcpToolCallResult struct {
 func StartServer(gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config) error {
 	fmt.Fprintln(os.Stderr, "[MCP] Starting m-cpg-go stdio server...")
 
-	// Initial load: Load all stored vectors from DB into the in-memory VectorStore
-	if err := LoadVectorsIntoMemory(gdb, vStore); err != nil {
-		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to load vectors from DB: %v\n", err)
-	}
-
 	// Start Tiering GC background worker
 	go func() {
 		fmt.Fprintln(os.Stderr, "[MCP] Starting background Tiering GC worker...")
@@ -716,9 +711,6 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 }
 
 func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config) (int, int, int, error) {
-	fmt.Fprintf(os.Stderr, "[MCP] Clearing old graph nodes for project: %s\n", projectID)
-	gdb.ClearProject(projectID)
-
 	var pyFiles, goFiles, mdFiles []string
 	err := filepath.Walk(projectPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -798,6 +790,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 					cfg.Embedding.Model,
 					cfg.Embedding.Endpoint,
 					cfg.Embedding.APIKey,
+					cfg.Embedding.Dimension,
 				)
 				resultsChan <- embedResult{
 					entityIndex: task.entityIndex,
@@ -845,7 +838,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			if embedText == "" {
 				embedText = ent.Name
 			}
-			res.embedding = vector.GeneratePseudoEmbedding(embedText)
+			res.embedding = vector.GeneratePseudoEmbedding(embedText, cfg.Embedding.Dimension)
 		}
 		embeddings[res.entityIndex] = res.embedding
 	}
@@ -880,7 +873,6 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 					if err != nil {
 						return fmt.Errorf("failed to save vector: %w", err)
 					}
-					vStore.AddVector(ent.ID, emb, map[string]any{"type": ent.Type, "fqn": ent.FQN, "name": ent.Name})
 				}
 			}
 			return nil
@@ -943,6 +935,7 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 		cfg.Embedding.Model,
 		cfg.Embedding.Endpoint,
 		cfg.Embedding.APIKey,
+		cfg.Embedding.Dimension,
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to embed query: %w", err)
@@ -1112,22 +1105,7 @@ func RunConsolidateMemories(eventIDs []string, insight string, gdb *db.GraphDB) 
 	return sb.String(), nil
 }
 
-func LoadVectorsIntoMemory(gdb *db.GraphDB, vStore *vector.VectorStore) error {
-	list, err := gdb.LoadVectors()
-	if err != nil {
-		return err
-	}
 
-	for _, v := range list {
-		emb := vector.BytesToFloat32Slice(v.Embedding)
-		if len(emb) > 0 {
-			vStore.AddVector(v.NodeID, emb, v.Metadata)
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "[MCP] Loaded %d vectors into memory index.\n", len(list))
-	return nil
-}
 
 func sendSuccessResponse(id interface{}, result interface{}) {
 	resp := jsonRPCResponse{
@@ -1210,6 +1188,7 @@ func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Confi
 		cfg.Embedding.Model,
 		cfg.Embedding.Endpoint,
 		cfg.Embedding.APIKey,
+		cfg.Embedding.Dimension,
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to embed query: %w", err)
@@ -1294,9 +1273,11 @@ func RunRemember(summary, details, eventType string, importance int, gdb *db.Gra
 		cfg.Embedding.Model,
 		cfg.Embedding.Endpoint,
 		cfg.Embedding.APIKey,
+		cfg.Embedding.Dimension,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to embed memory: %w", err)
+		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to embed memory: %v. Falling back to pseudo-embedding.\n", err)
+		emb = vector.GeneratePseudoEmbedding(embedText, cfg.Embedding.Dimension)
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
@@ -1347,13 +1328,15 @@ func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summ
 		details := fmt.Sprintf("Conversation Transcript:\n%s", transcript)
 
 		// Create vector embedding for the transcript summary
-		emb, err := vector.GetEmbedding(summary+"\n"+transcript, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey)
+		embText := summary + "\n" + transcript
+		emb, err := vector.GetEmbedding(embText, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey, cfg.Embedding.Dimension)
 		if err != nil {
-			return fmt.Errorf("failed to generate embedding: %v", err)
+			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to generate embedding for conversation: %v. Falling back to pseudo-embedding.\n", err)
+			emb = vector.GeneratePseudoEmbedding(embText, cfg.Embedding.Dimension)
 		}
 		var embBytes []byte
 		if emb != nil {
-			embBytes, _ = json.Marshal(emb)
+			embBytes = vector.Float32SliceToBytes(emb)
 		}
 
 		// Save as an event with type 'conversation', importance 2 (default cold layer)
@@ -1477,14 +1460,17 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 
 	if extractedName != "" {
 		// Query SQLite for exact name match in classes/methods
-		nodes, err := gdb.QueryNodes("", "", "")
+		nodes, err := gdb.QueryNodes("", extractedName, cfg.ProjectID)
 		if err == nil {
 			for _, node := range nodes {
-				name := node["name"].(string)
-				nodeType := node["type"].(string)
-				fqn := node["fqn"].(string)
-				if strings.EqualFold(name, extractedName) {
-					exactMatches = append(exactMatches, fmt.Sprintf("- [Exact Name Match] [%s] %s (Matches proposed name: '%s')\n", nodeType, fqn, extractedName))
+				name, okName := node["name"].(string)
+				nodeType, okType := node["type"].(string)
+				fqn, okFqn := node["fqn"].(string)
+
+				if okName && okType && okFqn {
+					if strings.EqualFold(name, extractedName) {
+						exactMatches = append(exactMatches, fmt.Sprintf("- [Exact Name Match] [%s] %s (Matches proposed name: '%s')\n", nodeType, fqn, extractedName))
+					}
 				}
 			}
 		}
@@ -1497,6 +1483,7 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 		cfg.Embedding.Model,
 		cfg.Embedding.Endpoint,
 		cfg.Embedding.APIKey,
+		cfg.Embedding.Dimension,
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to embed code snippet: %w", err)

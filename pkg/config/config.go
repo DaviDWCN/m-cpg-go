@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 type LLMConfig struct {
@@ -17,6 +18,7 @@ type EmbeddingConfig struct {
 	Model    string
 	Endpoint string
 	APIKey   string
+	Dimension int
 }
 
 type Config struct {
@@ -78,6 +80,14 @@ func LoadDefaultConfig() *Config {
 		embedKey = "ollama"
 	}
 
+	embedDimStr := os.Getenv("M_CPG_EMBEDDING_DIMENSION")
+	embedDim := 768
+	if embedDimStr != "" {
+		if d, err := strconv.Atoi(embedDimStr); err == nil && d > 0 {
+			embedDim = d
+		}
+	}
+
 	return &Config{
 		DBPath:    dbPath,
 		ProjectID: projectID,
@@ -92,6 +102,7 @@ func LoadDefaultConfig() *Config {
 			Model:    embedModel,
 			Endpoint: embedEndpoint,
 			APIKey:   embedKey,
+			Dimension: embedDim,
 		},
 	}
 }

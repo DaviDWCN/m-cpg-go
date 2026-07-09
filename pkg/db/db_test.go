@@ -5,6 +5,7 @@ import (
 	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 	"os"
 	"path/filepath"
+	"database/sql"
 	"testing"
 )
 
@@ -17,7 +18,7 @@ func TestGraphDB_Operations(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
-	gdb, err := InitDB(dbPath)
+	gdb, err := InitDB(dbPath, 768)
 	if err != nil {
 		t.Fatalf("failed to init db: %v", err)
 	}
@@ -109,7 +110,7 @@ func TestGraphDB_Operations(t *testing.T) {
 
 func TestQueryPattern(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_pattern.db")
-	gdb, err := InitDB(dbPath)
+	gdb, err := InitDB(dbPath, 768)
 	if err != nil {
 		t.Fatalf("InitDB failed: %v", err)
 	}
