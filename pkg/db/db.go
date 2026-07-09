@@ -621,6 +621,45 @@ func (g *GraphDB) ArchiveEvents(tx *sql.Tx, ids []string) error {
 	return nil
 }
 
+// GetRecentActiveEvents retrieves the most recent active events from the database
+func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
+	query := `
+	SELECT id, timestamp, event_type, summary, details, embedding
+	FROM events
+	WHERE status = 'active'
+	ORDER BY timestamp DESC
+	LIMIT ?;
+	`
+	rows, err := g.db.Query(query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent active events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []map[string]any
+	for rows.Next() {
+		var id, eventType, summary, details string
+		var timestamp int64
+		var embedding []byte
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding); err != nil {
+			return nil, err
+		}
+
+		events = append(events, map[string]any{
+			"id":         id,
+			"timestamp":  timestamp,
+			"event_type": eventType,
+			"summary":    summary,
+			"details":    details,
+			"embedding":  embedding,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating active events: %w", err)
+	}
+	return events, nil
+}
+
 // GetRecentEvents retrieves the most recent events from the database
 func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
 	query := `

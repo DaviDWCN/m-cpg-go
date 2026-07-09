@@ -342,6 +342,19 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Required: []string{},
 				},
 			},
+			{
+				Name:        "m_cpg_get_hot_context",
+				Description: "Retrieves a dynamic, highly condensed markdown index representing Current Tasks, Unresolved Issues, and Active Entities (Hot Memory Layer) to be injected at session start.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type:       "object",
+					Properties: map[string]interface{}{},
+					Required:   []string{},
+				},
+			},
 		}
 
 		sendSuccessResponse(req.ID, map[string]interface{}{
@@ -561,6 +574,17 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to initialize memory bank: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_get_hot_context":
+		res, err := RunGetHotContext(gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get hot context: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -1107,6 +1131,52 @@ func RunGetConceptHierarchy(limit int, gdb *db.GraphDB) (string, error) {
 		name := c["name"].(string)
 		frequency := c["frequency"].(int)
 		sb.WriteString(fmt.Sprintf("%d. %s (Frequency: %d)\n", i+1, name, frequency))
+	}
+
+	return sb.String(), nil
+}
+
+// RunGetHotContext queries the most recent 5 active events and top 5 concepts to generate a dynamic hot context index
+func RunGetHotContext(gdb *db.GraphDB) (string, error) {
+	events, err := gdb.GetRecentActiveEvents(5)
+	if err != nil {
+		return "", err
+	}
+
+	concepts, err := gdb.GetTopConcepts(5)
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# AI Agent Hot Context (Dynamic Index)\n\n")
+
+	sb.WriteString("## Active Entities / Concepts\n")
+	if len(concepts) > 0 {
+		for _, c := range concepts {
+			name := c["name"].(string)
+			frequency := c["frequency"].(int)
+			sb.WriteString(fmt.Sprintf("- **%s** (Freq: %d)\n", name, frequency))
+		}
+	} else {
+		sb.WriteString("No active concepts found.\n")
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("## Current Tasks / Unresolved Issues\n")
+	if len(events) > 0 {
+		for i, ev := range events {
+			t := time.Unix(ev["timestamp"].(int64), 0).Format("2006-01-02 15:04:05")
+			sb.WriteString(fmt.Sprintf("%d. **[%s]** %s (%s)\n", i+1, ev["event_type"], ev["summary"], t))
+			if details := ev["details"].(string); details != "" {
+				lines := strings.Split(details, "\n")
+				for _, line := range lines {
+					sb.WriteString(fmt.Sprintf("   > %s\n", line))
+				}
+			}
+		}
+	} else {
+		sb.WriteString("No unresolved tasks found.\n")
 	}
 
 	return sb.String(), nil
