@@ -25,7 +25,7 @@ func main() {
 	cfg := config.LoadDefaultConfig()
 
 	// Initialize Database
-	gdb, err := db.InitDB(cfg.DBPath)
+	gdb, err := db.InitDB(cfg.DBPath, cfg.Embedding.Dimension)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: Failed to initialize SQLite database: %v\n", err)
 		os.Exit(1)
@@ -102,11 +102,6 @@ func main() {
 		topK, _ := strconv.Atoi(*topKOpt)
 		if topK <= 0 {
 			topK = 5
-		}
-
-		// Load vectors to index for search
-		if err := mcp.LoadVectorsIntoMemory(gdb, vStore); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Failed to load existing vectors: %v\n", err)
 		}
 
 		fmt.Printf("Searching for query: '%s'...\n\n", query)

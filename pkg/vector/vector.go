@@ -30,11 +30,7 @@ func NewVectorStore(db *sql.DB) *VectorStore {
 	}
 }
 
-// AddVector is deprecated. Use db.SaveVector instead.
-func (s *VectorStore) AddVector(id string, vec []float32, metadata map[string]any) {}
 
-// RemoveVector is deprecated.
-func (s *VectorStore) RemoveVector(id string) {}
 
 // minHeap implements heap.Interface for SearchResult
 type minHeap []SearchResult
