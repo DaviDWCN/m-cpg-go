@@ -934,32 +934,105 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	sb.WriteString(fmt.Sprintf("Hybrid Search Results for query: '%s'\n", query))
 	sb.WriteString("==================================================\n\n")
 
-	// 2. Query VectorStore for matching IDs (Code Nodes)
-	results := vStore.Search(emb, topK)
-	if len(results) > 0 {
-		sb.WriteString("## Code Graph Memories:\n")
-		for i, res := range results {
+	// 2. Query VectorStore for matching IDs (Code Nodes) using expanded limits for RRF
+	results := vStore.Search(emb, topK*3)
+
+	// RRF Maps
+	vectorRanks := make(map[string]int)
+	graphScores := make(map[string]float32)
+
+	for i, res := range results {
+		vectorRanks[res.ID] = i + 1
+		neighbors, _ := gdb.GetNeighbors(res.ID)
+		for _, n := range neighbors {
+			nID := n["id"].(string)
+			graphScores[nID] += res.Score
+		}
+	}
+
+	// Sort graph neighbors by accumulated score to determine graph ranks
+	type graphNodeScore struct {
+		ID    string
+		Score float32
+	}
+	var gnsList []graphNodeScore
+	for id, score := range graphScores {
+		gnsList = append(gnsList, graphNodeScore{id, score})
+	}
+	sort.Slice(gnsList, func(i, j int) bool {
+		return gnsList[i].Score > gnsList[j].Score
+	})
+
+	graphRanks := make(map[string]int)
+	for i, gns := range gnsList {
+		graphRanks[gns.ID] = i + 1
+	}
+
+	// Calculate RRF for all unique nodes
+	rrfScores := make(map[string]float64)
+	allNodes := make(map[string]bool)
+	for id := range vectorRanks {
+		allNodes[id] = true
+	}
+	for id := range graphRanks {
+		allNodes[id] = true
+	}
+
+	for id := range allNodes {
+		var score float64
+		if rank, ok := vectorRanks[id]; ok {
+			score += 1.0 / (60.0 + float64(rank))
+		}
+		if rank, ok := graphRanks[id]; ok {
+			score += 1.0 / (60.0 + float64(rank))
+		}
+		rrfScores[id] = score
+	}
+
+	// Sort final RRF scores
+	type rrfNodeScore struct {
+		ID    string
+		Score float64
+	}
+	var rrfList []rrfNodeScore
+	for id, score := range rrfScores {
+		rrfList = append(rrfList, rrfNodeScore{id, score})
+	}
+	sort.Slice(rrfList, func(i, j int) bool {
+		return rrfList[i].Score > rrfList[j].Score
+	})
+
+	if topK > len(rrfList) {
+		topK = len(rrfList)
+	}
+	finalResults := rrfList[:topK]
+
+	if len(finalResults) > 0 {
+		sb.WriteString("## Code Graph Memories (Hybrid RRF Ranked):\n")
+		for i, res := range finalResults {
 			node, err := gdb.GetNode(res.ID)
 			if err != nil || node == nil {
 				continue
 			}
 
-			nodeType := node["type"].(string)
-			fqn := node["fqn"].(string)
-			code := node["code"].(string)
-			docstring := node["docstring"].(string)
+			nodeType, _ := node["type"].(string)
+			fqn, _ := node["fqn"].(string)
+			code, _ := node["code"].(string)
+			docstring, _ := node["docstring"].(string)
 
-			sb.WriteString(fmt.Sprintf("%d. [%s] %s (Score: %.4f)\n", i+1, nodeType, fqn, res.Score))
+			sb.WriteString(fmt.Sprintf("%d. [%s] %s (RRF Score: %.4f)\n", i+1, nodeType, fqn, res.Score))
 			if docstring != "" {
 				sb.WriteString(fmt.Sprintf("   Docstring: %s\n", strings.ReplaceAll(docstring, "\n", "\n   ")))
 			}
 
-			// Fetch neighboring classes/methods/modules
+			// Fetch neighboring classes/methods/modules for context
 			neighbors, _ := gdb.GetNeighbors(res.ID)
 			if len(neighbors) > 0 {
 				var nList []string
 				for _, n := range neighbors {
-					nList = append(nList, fmt.Sprintf("%s (%s)", n["name"], n["type"]))
+					nameStr, _ := n["name"].(string)
+					typeStr, _ := n["type"].(string)
+					nList = append(nList, fmt.Sprintf("%s (%s)", nameStr, typeStr))
 				}
 				sb.WriteString(fmt.Sprintf("   Neighbors: %s\n", strings.Join(nList, ", ")))
 			}

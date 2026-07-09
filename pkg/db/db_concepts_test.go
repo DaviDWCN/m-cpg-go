@@ -1,6 +1,8 @@
 package db
 
 import (
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 	"os"
 	"testing"
 )

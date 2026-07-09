@@ -1,6 +1,8 @@
 package db
 
 import (
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,7 +77,7 @@ func TestGraphDB_Operations(t *testing.T) {
 	}
 
 	// 6. Test Save and Load Vectors
-	embData := []byte{1, 2, 3, 4, 5, 6, 7, 8} // dummy bytes
+	embData := make([]byte, 768*4) // dummy bytes for 768 dimensions
 	err = gdb.SaveVector(nil, nodeID2, embData, map[string]any{"type": "Class"})
 	if err != nil {
 		t.Errorf("failed to save vector: %v", err)

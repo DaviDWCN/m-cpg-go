@@ -33,7 +33,7 @@ func main() {
 	defer gdb.Close()
 
 	// Initialize Vector Store
-	vStore := vector.NewVectorStore()
+	vStore := vector.NewVectorStore(gdb.GetDB())
 
 	switch command {
 	case "mcp":

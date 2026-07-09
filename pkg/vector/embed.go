@@ -7,9 +7,9 @@ import (
 	"hash/fnv"
 	"io"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -77,27 +77,41 @@ func GetEmbedding(text, provider, model, endpoint, apiKey string) ([]float32, er
 	return res.Data[0].Embedding, nil
 }
 
-// GeneratePseudoEmbedding creates a deterministic 768-dimensional float32 vector based on text content
+// GeneratePseudoEmbedding creates a feature-hashing based TF-BoW 768-dimensional float32 vector based on text content.
+// This preserves some semantic similarity when external APIs fail.
 func GeneratePseudoEmbedding(text string) []float32 {
 	dims := 768
 	vec := make([]float32, dims)
 
-	h := fnv.New64a()
-	h.Write([]byte(text))
-	seed := int64(h.Sum64())
-	rng := rand.New(rand.NewSource(seed))
-
-	var sumSquares float32
-	for d := 0; d < dims; d++ {
-		// Map rand.Float32() [0.0, 1.0) to [-1.0, 1.0)
-		val := rng.Float32()*2.0 - 1.0
-		vec[d] = val
-		sumSquares += val * val
+	// Basic tokenization
+	words := strings.Fields(strings.ToLower(text))
+	if len(words) == 0 {
+		return vec
 	}
 
-	// Normalize the pseudo-embedding vector to unit length
-	norm := float32(math.Sqrt(float64(sumSquares)))
-	if norm > 0 {
+	// Feature Hashing
+	var sumSquares float32
+	for _, word := range words {
+		// Clean basic punctuation
+		word = strings.Trim(word, ".,!?\"'()[]{}")
+		if word == "" {
+			continue
+		}
+
+		h := fnv.New32a()
+		h.Write([]byte(word))
+		idx := h.Sum32() % uint32(dims)
+		vec[idx] += 1.0
+	}
+
+	// Calculate L2 Norm
+	for _, v := range vec {
+		sumSquares += v * v
+	}
+
+	// Normalize
+	if sumSquares > 0 {
+		norm := float32(math.Sqrt(float64(sumSquares)))
 		for i := range vec {
 			vec[i] /= norm
 		}
