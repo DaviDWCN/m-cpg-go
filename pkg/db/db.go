@@ -419,6 +419,54 @@ func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 }
 
 // QueryNodes searches nodes by type, name, or FQN suffix matching
+// SearchMultiHop executes a multi-hop graph query starting from the given nodeID,
+// traversing CONTAINS and CALLS edges up to maxDepth.
+func (g *GraphDB) SearchMultiHop(nodeID string, maxDepth int) ([]map[string]any, error) {
+	query := `
+	WITH RECURSIVE
+	search_graph(id, type, name, fqn, depth, path) AS (
+		SELECT id, type, name, fqn, 0, id
+		FROM nodes
+		WHERE id = ?
+		UNION ALL
+		SELECT n.id, n.type, n.name, n.fqn, sg.depth + 1, sg.path || '->' || n.id
+		FROM edges e
+		JOIN nodes n ON e.target = n.id
+		JOIN search_graph sg ON e.source = sg.id
+		WHERE sg.depth < ?
+		  AND (e.label = 'CONTAINS' OR e.label = 'CALLS')
+		  AND instr('->' || sg.path || '->', '->' || n.id || '->') = 0
+	)
+	SELECT id, type, name, fqn, MIN(depth) as min_depth
+	FROM search_graph
+	GROUP BY id, type, name, fqn
+	ORDER BY min_depth;
+	`
+
+	rows, err := g.db.Query(query, nodeID, maxDepth)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]any
+	for rows.Next() {
+		var id, nodeType, name, fqn string
+		var minDepth int
+		if err := rows.Scan(&id, &nodeType, &name, &fqn, &minDepth); err != nil {
+			continue
+		}
+		results = append(results, map[string]any{
+			"id":    id,
+			"type":  nodeType,
+			"name":  name,
+			"fqn":   fqn,
+			"depth": minDepth,
+		})
+	}
+	return results, nil
+}
+
 func (g *GraphDB) QueryNodes(nodeType, nameFilter, projectID string) ([]map[string]any, error) {
 	sqlQuery := `SELECT id, type, name, fqn, code, docstring, project_id, properties FROM nodes WHERE 1=1`
 	var args []any

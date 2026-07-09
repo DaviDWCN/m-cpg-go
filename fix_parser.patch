@@ -1,0 +1,11 @@
+--- pkg/parser/ast_go.go
++++ pkg/parser/ast_go.go
+@@ -165,7 +165,7 @@
+			if targetName != "" {
+				relations = append(relations, CodeRelation{
+					Source: funcID,
+-					Target: "call_" + targetName, // Use a generic prefix since we don't know the exact FQN of the target
++					Target: "call_" + targetName,
+					Label:  "CALLS",
+				})
+			}

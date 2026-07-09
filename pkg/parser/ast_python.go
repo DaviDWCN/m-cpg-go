@@ -136,6 +136,29 @@ func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRe
 				Label:  "CONTAINS",
 			})
 
+			// Extract simple function calls using regex within the method block
+			callRegex := regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\(.*\)`)
+			codeLines := strings.Split(funcCode, "\n")
+			// Skip the def line itself to avoid self-reference for the definition
+			if len(codeLines) > 1 {
+				for _, codeLine := range codeLines[1:] {
+					callMatches := callRegex.FindAllStringSubmatch(codeLine, -1)
+					for _, m := range callMatches {
+						if len(m) > 1 {
+							targetName := m[1]
+							// Exclude common keywords that look like function calls
+							if targetName != "if" && targetName != "elif" && targetName != "while" && targetName != "for" && targetName != "with" {
+								relations = append(relations, CodeRelation{
+									Source: funcID,
+									Target: "call_" + targetName,
+									Label:  "CALLS",
+								})
+							}
+						}
+					}
+				}
+			}
+
 			scopeStack = append(scopeStack, scope{
 				id:         funcID,
 				fqn:        funcFqn,
