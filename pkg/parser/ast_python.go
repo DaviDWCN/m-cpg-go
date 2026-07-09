@@ -177,7 +177,13 @@ if __name__ == "__main__":
     print(json.dumps(res))
 `
 
-	cmd := exec.Command("python3", "-c", pythonScript, moduleFqn, moduleID)
+	pythonBin := "python3"
+	if _, err := exec.LookPath(pythonBin); err != nil {
+		if _, err2 := exec.LookPath("python"); err2 == nil {
+			pythonBin = "python"
+		}
+	}
+	cmd := exec.Command(pythonBin, "-c", pythonScript, moduleFqn, moduleID)
 	cmd.Stdin = strings.NewReader(code)
 	var out bytes.Buffer
 	cmd.Stdout = &out

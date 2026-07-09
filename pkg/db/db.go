@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	_ "modernc.org/sqlite"
 )
 
 type GraphDB struct {
@@ -69,6 +68,7 @@ func InitDB(dbPath string, vectorDim int) (*GraphDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	gdb := &GraphDB{db: db}
 	if err := gdb.ensureSchema(vectorDim); err != nil {
