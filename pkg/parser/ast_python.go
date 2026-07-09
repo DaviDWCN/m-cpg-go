@@ -2,11 +2,12 @@ package parser
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
+
 	"fmt"
 	"os"
-	"os/exec"
+
+	"github.com/go-python/gpython/ast"
+	"github.com/go-python/gpython/parser"
 	"regexp"
 	"strings"
 )
@@ -51,153 +52,214 @@ func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRe
 }
 
 func parsePythonFileWithAST(code, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {
-	pythonScript := `
-import ast
-import json
-import sys
+	node, err := parser.ParseString(code, "exec")
+	if err != nil {
+		return nil, nil, fmt.Errorf("gpython syntax error: %w", err)
+	}
 
-def get_code_slice(lines, start_line, end_line):
-    if end_line is None:
-        return ""
-    # ast lineno is 1-indexed, inclusive
-    # end_lineno is also 1-indexed, inclusive
-    return "\n".join(lines[start_line-1:end_line])
+	lines := strings.Split(code, "\n")
+	var entities []CodeEntity
+	var relations []CodeRelation
 
-def parse(code, module_fqn, module_id):
-    lines = code.split("\n")
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+	moduleName := moduleFqn
+	if parts := strings.Split(moduleFqn, "."); len(parts) > 0 {
+		moduleName = parts[len(parts)-1]
+	}
 
-    entities = []
-    relations = []
-
-    entities.append({
-        "ID": module_id,
-        "Type": "Module",
-        "Name": module_fqn.split('.')[-1] if '.' in module_fqn else module_fqn,
-        "FQN": module_fqn,
-        "Code": code,
-        "Docstring": ast.get_docstring(tree) or "",
-        "ParentID": ""
-    })
-
-    class Visitor(ast.NodeVisitor):
-        def __init__(self):
-            self.scope_stack = [(module_id, module_fqn)]
-
-        def visit_ClassDef(self, node):
-            parent_id, parent_fqn = self.scope_stack[-1]
-            class_name = node.name
-            class_fqn = f"{parent_fqn}.{class_name}"
-            class_id = f"class_{class_fqn}"
-
-            entities.append({
-                "ID": class_id,
-                "Type": "Class",
-                "Name": class_name,
-                "FQN": class_fqn,
-                "Code": get_code_slice(lines, node.lineno, getattr(node, 'end_lineno', node.lineno)),
-                "Docstring": ast.get_docstring(node) or "",
-                "ParentID": parent_id
-            })
-
-            relations.append({
-                "Source": parent_id,
-                "Target": class_id,
-                "Label": "CONTAINS"
-            })
-
-            self.scope_stack.append((class_id, class_fqn))
-            self.generic_visit(node)
-            self.scope_stack.pop()
-
-        def visit_FunctionDef(self, node):
-            self.handle_function(node)
-
-        def visit_AsyncFunctionDef(self, node):
-            self.handle_function(node)
-
-        def handle_function(self, node):
-            parent_id, parent_fqn = self.scope_stack[-1]
-            func_name = node.name
-            func_fqn = f"{parent_fqn}.{func_name}"
-            func_id = f"method_{func_fqn}"
-
-            entities.append({
-                "ID": func_id,
-                "Type": "Method",
-                "Name": func_name,
-                "FQN": func_fqn,
-                "Code": get_code_slice(lines, node.lineno, getattr(node, 'end_lineno', node.lineno)),
-                "Docstring": ast.get_docstring(node) or "",
-                "ParentID": parent_id
-            })
-
-            relations.append({
-                "Source": parent_id,
-                "Target": func_id,
-                "Label": "CONTAINS"
-            })
-
-            class CallVisitor(ast.NodeVisitor):
-                def visit_Call(self, call_node):
-                    target_name = None
-                    if isinstance(call_node.func, ast.Name):
-                        target_name = call_node.func.id
-                    elif isinstance(call_node.func, ast.Attribute):
-                        target_name = call_node.func.attr
-
-                    if target_name:
-                        relations.append({
-                            "Source": func_id,
-                            "Target": f"call_{target_name}",
-                            "Label": "CALLS"
-                        })
-                    self.generic_visit(call_node)
-
-            cv = CallVisitor()
-            for stmt in node.body:
-                cv.visit(stmt)
-
-            self.scope_stack.append((func_id, func_fqn))
-            self.generic_visit(node)
-            self.scope_stack.pop()
-
-    Visitor().visit(tree)
-    return {"Entities": entities, "Relations": relations}
-
-if __name__ == "__main__":
-    code = sys.stdin.read()
-    module_fqn = sys.argv[1]
-    module_id = sys.argv[2]
-    res = parse(code, module_fqn, module_id)
-    print(json.dumps(res))
-`
-
-	pythonBin := "python3"
-	if _, err := exec.LookPath(pythonBin); err != nil {
-		if _, err2 := exec.LookPath("python"); err2 == nil {
-			pythonBin = "python"
+	docstring := ""
+	if mod, ok := node.(*ast.Module); ok && len(mod.Body) > 0 {
+		if exprStmt, ok := mod.Body[0].(*ast.ExprStmt); ok {
+			if strExpr, ok := exprStmt.Value.(*ast.Str); ok {
+				docstring = string(strExpr.S)
+			}
 		}
 	}
-	cmd := exec.Command(pythonBin, "-c", pythonScript, moduleFqn, moduleID)
-	cmd.Stdin = strings.NewReader(code)
-	var out bytes.Buffer
-	cmd.Stdout = &out
 
-	if err := cmd.Run(); err != nil {
-		return nil, nil, fmt.Errorf("python script failed: %w", err)
+	entities = append(entities, CodeEntity{
+		ID:        moduleID,
+		Type:      "Module",
+		Name:      moduleName,
+		FQN:       moduleFqn,
+		Code:      code,
+		Docstring: docstring,
+		ParentID:  "",
+	})
+
+	var walk func(n ast.Ast, parentID, parentFqn string)
+	walk = func(n ast.Ast, parentID, parentFqn string) {
+		switch t := n.(type) {
+		case *ast.Module:
+			for _, stmt := range t.Body {
+				walk(stmt, parentID, parentFqn)
+			}
+		case *ast.ClassDef:
+			className := string(t.Name)
+			classFqn := parentFqn + "." + className
+			classID := "class_" + classFqn
+
+			classDoc := ""
+			if len(t.Body) > 0 {
+				if exprStmt, ok := t.Body[0].(*ast.ExprStmt); ok {
+					if strExpr, ok := exprStmt.Value.(*ast.Str); ok {
+						classDoc = string(strExpr.S)
+					}
+				}
+			}
+
+			entities = append(entities, CodeEntity{
+				ID:        classID,
+				Type:      "Class",
+				Name:      className,
+				FQN:       classFqn,
+				Code:      sliceCodePython(lines, t.Lineno, t.Lineno), // fallback
+				Docstring: classDoc,
+				ParentID:  parentID,
+			})
+			relations = append(relations, CodeRelation{
+				Source: parentID,
+				Target: classID,
+				Label:  "CONTAINS",
+			})
+
+			for _, stmt := range t.Body {
+				walk(stmt, classID, classFqn)
+			}
+		case *ast.FunctionDef:
+			funcName := string(t.Name)
+			funcFqn := parentFqn + "." + funcName
+			funcID := "method_" + funcFqn
+
+			funcDoc := ""
+			if len(t.Body) > 0 {
+				if exprStmt, ok := t.Body[0].(*ast.ExprStmt); ok {
+					if strExpr, ok := exprStmt.Value.(*ast.Str); ok {
+						funcDoc = string(strExpr.S)
+					}
+				}
+			}
+
+			entities = append(entities, CodeEntity{
+				ID:        funcID,
+				Type:      "Method",
+				Name:      funcName,
+				FQN:       funcFqn,
+				Code:      sliceCodePython(lines, t.Lineno, t.Lineno),
+				Docstring: funcDoc,
+				ParentID:  parentID,
+			})
+			relations = append(relations, CodeRelation{
+				Source: parentID,
+				Target: funcID,
+				Label:  "CONTAINS",
+			})
+
+			var inspect func(ast.Ast)
+			inspect = func(cn ast.Ast) {
+				if call, ok := cn.(*ast.Call); ok {
+					if name, ok := call.Func.(*ast.Name); ok {
+						relations = append(relations, CodeRelation{
+							Source: funcID,
+							Target: "call_" + string(name.Id),
+							Label:  "CALLS",
+						})
+					} else if attr, ok := call.Func.(*ast.Attribute); ok {
+						relations = append(relations, CodeRelation{
+							Source: funcID,
+							Target: "call_" + string(attr.Attr),
+							Label:  "CALLS",
+						})
+					}
+				}
+				switch n := cn.(type) {
+				case *ast.ExprStmt:
+					inspect(n.Value)
+				case *ast.Call:
+					inspect(n.Func)
+					for _, arg := range n.Args {
+						inspect(arg)
+					}
+				case *ast.Assign:
+					for _, target := range n.Targets {
+						inspect(target)
+					}
+					inspect(n.Value)
+				case *ast.Return:
+					if n.Value != nil {
+						inspect(n.Value)
+					}
+				case *ast.If:
+					inspect(n.Test)
+					for _, stmt := range n.Body {
+						inspect(stmt)
+					}
+					for _, stmt := range n.Orelse {
+						inspect(stmt)
+					}
+				case *ast.For:
+					inspect(n.Target)
+					inspect(n.Iter)
+					for _, stmt := range n.Body {
+						inspect(stmt)
+					}
+					for _, stmt := range n.Orelse {
+						inspect(stmt)
+					}
+				case *ast.While:
+					inspect(n.Test)
+					for _, stmt := range n.Body {
+						inspect(stmt)
+					}
+					for _, stmt := range n.Orelse {
+						inspect(stmt)
+					}
+				case *ast.FunctionDef:
+					// Don't recurse into inner functions to avoid polluting this method's calls
+				case *ast.ClassDef:
+					// Same for inner classes
+				case *ast.Attribute:
+					inspect(n.Value)
+				}
+			}
+			for _, stmt := range t.Body {
+				inspect(stmt)
+			}
+		}
 	}
 
-	var result pythonASTResult
-	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
-		return nil, nil, fmt.Errorf("failed to unmarshal python script output: %w", err)
+	walk(node, moduleID, moduleFqn)
+
+	return entities, relations, nil
+}
+
+func sliceCodePython(lines []string, startLine, endLine int) string {
+	if startLine < 1 || startLine > len(lines) {
+		return ""
+	}
+	if endLine < startLine {
+		endLine = startLine
 	}
 
-	return result.Entities, result.Relations, nil
+	// Try to find the end of the block logically based on indentation
+	startIdx := startLine - 1
+	baseIndent := countIndentation(lines[startIdx])
+
+	endIdx := startIdx
+	for i := startIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			endIdx = i
+			continue
+		}
+
+		indent := countIndentation(line)
+		if indent <= baseIndent && !strings.HasPrefix(trimmed, "#") {
+			break
+		}
+		endIdx = i
+	}
+
+	return strings.Join(lines[startIdx:endIdx+1], "\n")
 }
 
 func parsePythonFileRegex(filePath, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {
