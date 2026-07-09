@@ -2,6 +2,8 @@ package db
 
 import (
 	"database/sql"
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +15,10 @@ import (
 
 type GraphDB struct {
 	db *sql.DB
+}
+
+func (g *GraphDB) GetDB() *sql.DB {
+	return g.db
 }
 
 type sqlExecutor interface {
@@ -59,7 +65,7 @@ func InitDB(dbPath string) (*GraphDB, error) {
 	}
 
 	// Open SQLite database
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
@@ -121,15 +127,18 @@ func (g *GraphDB) ensureSchema() error {
 	}
 
 	// Create vectors table
-	createVectorsTable := `
-	CREATE TABLE IF NOT EXISTS vectors (
-		node_id TEXT PRIMARY KEY,
-		embedding BLOB NOT NULL,
+	createVectorsTable := `CREATE VIRTUAL TABLE IF NOT EXISTS vectors USING vec0(embedding float[768]);`
+	createVectorsMetaTable := `CREATE TABLE IF NOT EXISTS vectors_meta (
+		rowid INTEGER PRIMARY KEY,
+		node_id TEXT UNIQUE NOT NULL,
 		metadata TEXT,
 		FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 	);`
 	if _, err := g.db.Exec(createVectorsTable); err != nil {
 		return fmt.Errorf("failed to create vectors table: %w", err)
+	}
+	if _, err := g.db.Exec(createVectorsMetaTable); err != nil {
+		return fmt.Errorf("failed to create vectors meta table: %w", err)
 	}
 
 	// Create events table for developer preferences and session logs
@@ -201,7 +210,6 @@ func (g *GraphDB) ensureSchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);",
 		"CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);",
 		"CREATE INDEX IF NOT EXISTS idx_edges_label ON edges(label);",
-		"CREATE INDEX IF NOT EXISTS idx_vectors_node ON vectors(node_id);",
 		"CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
 		"CREATE INDEX IF NOT EXISTS idx_concepts_freq ON concepts(frequency DESC);",
 	}
@@ -555,12 +563,19 @@ func (g *GraphDB) SaveVector(tx *sql.Tx, nodeID string, embedding []byte, metada
 		metadataJSON = string(data)
 	}
 
-	query := `
-	INSERT OR REPLACE INTO vectors (node_id, embedding, metadata)
-	VALUES (?, ?, ?);
-	`
+	// Insert or replace metadata to get a rowid
+	queryMeta := `INSERT INTO vectors_meta (node_id, metadata) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET metadata=excluded.metadata RETURNING rowid;`
 	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, nodeID, embedding, metadataJSON)
+	var rowid int64
+	err := executor.QueryRow(queryMeta, nodeID, metadataJSON).Scan(&rowid)
+	if err != nil {
+		return fmt.Errorf("failed to save vector meta and get rowid: %w", err)
+	}
+
+	// Insert vector using rowid
+	executor.Exec(`DELETE FROM vectors WHERE rowid = ?`, rowid)
+	query := `INSERT INTO vectors (rowid, embedding) VALUES (?, ?);`
+	_, err = executor.Exec(query, rowid, embedding)
 	if err != nil {
 		return fmt.Errorf("failed to save vector: %w", err)
 	}
@@ -575,7 +590,7 @@ type VectorRecord struct {
 
 // LoadVectors loads all stored vectors from the database
 func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
-	query := "SELECT node_id, embedding, metadata FROM vectors;"
+	query := "SELECT m.node_id, v.embedding, m.metadata FROM vectors v JOIN vectors_meta m ON v.rowid = m.rowid;"
 	rows, err := g.db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load vectors: %w", err)

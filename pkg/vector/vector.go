@@ -1,9 +1,10 @@
 package vector
 
 import (
-	"container/heap"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"math"
-	"sync"
 	"unsafe"
 )
 
@@ -20,56 +21,20 @@ type SearchResult struct {
 }
 
 type VectorStore struct {
-	mu    sync.RWMutex
-	nodes []VectorNode
-	index map[string]int // ID -> index in nodes
+	db *sql.DB
 }
 
-func NewVectorStore() *VectorStore {
+func NewVectorStore(db *sql.DB) *VectorStore {
 	return &VectorStore{
-		nodes: make([]VectorNode, 0),
-		index: make(map[string]int),
+		db: db,
 	}
 }
 
-// AddVector adds a vector to the in-memory store
-func (s *VectorStore) AddVector(id string, vec []float32, metadata map[string]any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// AddVector is deprecated. Use db.SaveVector instead.
+func (s *VectorStore) AddVector(id string, vec []float32, metadata map[string]any) {}
 
-	// Update if exists, otherwise append
-	if idx, exists := s.index[id]; exists {
-		s.nodes[idx].Vector = vec
-		s.nodes[idx].Metadata = metadata
-		return
-	}
-
-	s.index[id] = len(s.nodes)
-	s.nodes = append(s.nodes, VectorNode{
-		ID:       id,
-		Vector:   vec,
-		Metadata: metadata,
-	})
-}
-
-// RemoveVector deletes a vector from the in-memory store
-func (s *VectorStore) RemoveVector(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	idx, exists := s.index[id]
-	if !exists {
-		return
-	}
-
-	lastIdx := len(s.nodes) - 1
-	if idx != lastIdx {
-		s.nodes[idx] = s.nodes[lastIdx]
-		s.index[s.nodes[idx].ID] = idx
-	}
-	s.nodes = s.nodes[:lastIdx]
-	delete(s.index, id)
-}
+// RemoveVector is deprecated.
+func (s *VectorStore) RemoveVector(id string) {}
 
 // minHeap implements heap.Interface for SearchResult
 type minHeap []SearchResult
@@ -92,49 +57,49 @@ func (h *minHeap) Pop() interface{} {
 
 // Search retrieves the top K matching vectors using cosine similarity
 func (s *VectorStore) Search(queryVec []float32, limit int) []SearchResult {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if len(queryVec) == 0 || len(s.nodes) == 0 || limit <= 0 {
+	if s.db == nil || len(queryVec) == 0 || limit <= 0 {
 		return nil
 	}
 
-	// Pre-calculate query norm
-	var normQ float32
-	for _, val := range queryVec {
-		normQ += val * val
+	embBytes := Float32SliceToBytes(queryVec)
+	query := `
+		SELECT m.node_id, vec_distance_cosine(v.embedding, ?1) as dist, m.metadata
+		FROM vectors v
+		JOIN vectors_meta m ON v.rowid = m.rowid
+		WHERE v.rowid IN (SELECT rowid FROM vectors WHERE embedding MATCH ?1 AND k = ?2)
+	`
+
+	rows, err := s.db.Query(query, embBytes, limit)
+	if err != nil {
+		fmt.Printf("Vector Search Error: %v\n", err)
+		return nil
 	}
-	normQ = float32(math.Sqrt(float64(normQ)))
+	defer rows.Close()
 
-	h := &minHeap{}
-	heap.Init(h)
+	var results []SearchResult
+	for rows.Next() {
+		var id string
+		var dist float32
+		var metaStr sql.NullString
 
-	for _, node := range s.nodes {
-		score := cosineSimilarityWithQueryNorm(queryVec, node.Vector, normQ)
-
-		if h.Len() < limit {
-			heap.Push(h, SearchResult{
-				ID:       node.ID,
-				Score:    score,
-				Metadata: node.Metadata,
-			})
-		} else if score > (*h)[0].Score {
-			// If score is better than the worst score in the heap, replace it
-			(*h)[0] = SearchResult{
-				ID:       node.ID,
-				Score:    score,
-				Metadata: node.Metadata,
-			}
-			heap.Fix(h, 0)
+		if err := rows.Scan(&id, &dist, &metaStr); err != nil {
+			continue
 		}
-	}
 
-	// Extract results from heap (they will come out in ascending order of score)
-	results := make([]SearchResult, h.Len())
-	for i := len(results) - 1; i >= 0; i-- {
-		results[i] = heap.Pop(h).(SearchResult)
-	}
+		var metadata map[string]any
+		if metaStr.Valid && metaStr.String != "" {
+			json.Unmarshal([]byte(metaStr.String), &metadata)
+		} else {
+			metadata = make(map[string]any)
+		}
 
+		results = append(results, SearchResult{
+			ID:       id,
+			// Convert distance to similarity (1 - distance) for backward compatibility
+			Score:    1.0 - dist,
+			Metadata: metadata,
+		})
+	}
 	return results
 }
 
