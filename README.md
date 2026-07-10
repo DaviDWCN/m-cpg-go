@@ -4,6 +4,31 @@ A lightweight, in-process, zero-dependency Code Graph & Vector Memory System for
 
 ## Features
 - **In-process SQLite Graph Engine**: Stores files, classes, methods, and their relations (`CONTAINS`, `CALLS`, etc.) using SQLite.
+
+## LLM Embedding Forwarder (Optional Utility)
+If the machine running `m-cpg-go` cannot directly access external LLM APIs (e.g., due to network restrictions), you can run the included `llm-forwarder` utility on a machine that *does* have internet access, and configure `m-cpg-go` to point to it.
+
+**1. Build the forwarder**
+```bash
+go build -o llm-forwarder ./cmd/llm-forwarder/main.go
+```
+
+**2. Run the forwarder on the internet-connected machine**
+```bash
+# Example: Forwarding to OpenAI
+./llm-forwarder -port 8080 -target "https://api.openai.com/v1" -key "sk-YOUR_OPENAI_KEY"
+
+# Example: Forwarding to a local Ollama instance
+./llm-forwarder -port 8080 -target "http://localhost:11434/api"
+```
+
+**3. Configure `m-cpg-go` to use the forwarder**
+On your local machine, set the endpoint to point to the forwarder's address (assuming it is running on `http://forwarder-ip:8080`):
+```bash
+export M_CPG_EMBEDDING_PROVIDER="openai"
+export M_CPG_EMBEDDING_MODEL="text-embedding-3-small"
+export M_CPG_EMBEDDING_ENDPOINT="http://forwarder-ip:8080"
+```
 - **In-process Vector Store**: Performs vector indexing and concurrent cosine similarity query retrieval.
 - **Structural Code Parser**: Extracts class/method layout and docstrings from Python and Go files.
 - **MCP Server**: Implements the Model Context Protocol stdio transport for direct connection with AI IDEs (Cursor, Windsurf, Claude Desktop).

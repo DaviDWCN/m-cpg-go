@@ -10,6 +10,9 @@ deploy/m-cpg-go
 # Test binary, built with `go test -c`
 *.test
 
+# Ignore deployed binaries
+deploy/
+
 # Output of the go coverage tool, contains systematically generated coverage reporting data
 *.out
 
