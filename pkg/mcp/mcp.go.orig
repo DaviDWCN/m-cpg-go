@@ -443,28 +443,6 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Required: []string{"fqn"},
 				},
 			},
-			{
-				Name:        "m_cpg_find_path",
-				Description: "Queries the graph for the shortest path between two nodes by their FQNs.",
-				InputSchema: struct {
-					Type       string                 `json:"type"`
-					Properties map[string]interface{} `json:"properties"`
-					Required   []string               `json:"required"`
-				}{
-					Type: "object",
-					Properties: map[string]interface{}{
-						"source_fqn": map[string]string{
-							"type":        "string",
-							"description": "The Fully Qualified Name (FQN) of the source node.",
-						},
-						"target_fqn": map[string]string{
-							"type":        "string",
-							"description": "The Fully Qualified Name (FQN) of the target node.",
-						},
-					},
-					Required: []string{"source_fqn", "target_fqn"},
-				},
-			},
 		}
 
 		sendSuccessResponse(req.ID, map[string]interface{}{
@@ -803,24 +781,6 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get node dependencies: %v", err)}},
-			}, nil
-		}
-		return &mcpToolCallResult{
-			Content: []mcpContent{{Type: "text", Text: res}},
-		}, nil
-
-	case "m_cpg_find_path":
-		var params struct {
-			SourceFqn string `json:"source_fqn"`
-			TargetFqn string `json:"target_fqn"`
-		}
-		if err := json.Unmarshal(args, &params); err != nil {
-			return nil, err
-		}
-		res, err := RunFindPath(params.SourceFqn, params.TargetFqn, gdb)
-		if err != nil {
-			return &mcpToolCallResult{
-				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to find path: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -1816,84 +1776,4 @@ func RunGetNodeDependencies(fqn string, gdb *db.GraphDB) (string, error) {
 	}
 
 	return sb.String(), nil
-}
-
-// RunFindPath searches for the shortest path between two nodes in the graph using BFS.
-func RunFindPath(sourceFqn, targetFqn string, gdb *db.GraphDB) (string, error) {
-	sourceNodes, err := gdb.QueryNodes("", sourceFqn, "")
-	if err != nil {
-		return "", err
-	}
-	var sourceNodeID string
-	for _, node := range sourceNodes {
-		if nodeFQN, ok := node["fqn"].(string); ok && nodeFQN == sourceFqn {
-			sourceNodeID = node["id"].(string)
-			break
-		}
-	}
-	if sourceNodeID == "" {
-		return fmt.Sprintf("Source node with FQN '%s' not found.", sourceFqn), nil
-	}
-
-	targetNodes, err := gdb.QueryNodes("", targetFqn, "")
-	if err != nil {
-		return "", err
-	}
-	var targetNodeID string
-	for _, node := range targetNodes {
-		if nodeFQN, ok := node["fqn"].(string); ok && nodeFQN == targetFqn {
-			targetNodeID = node["id"].(string)
-			break
-		}
-	}
-	if targetNodeID == "" {
-		return fmt.Sprintf("Target node with FQN '%s' not found.", targetFqn), nil
-	}
-
-	if sourceNodeID == targetNodeID {
-		return fmt.Sprintf("Source and target nodes are the same ('%s').", sourceFqn), nil
-	}
-
-	// BFS
-	queue := [][]string{{sourceNodeID}}
-	visited := make(map[string]bool)
-	visited[sourceNodeID] = true
-
-	for len(queue) > 0 {
-		path := queue[0]
-		queue = queue[1:]
-		current := path[len(path)-1]
-
-		if current == targetNodeID {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("Shortest path from '%s' to '%s':\n", sourceFqn, targetFqn))
-			for i, nodeID := range path {
-				node, err := gdb.GetNode(nodeID)
-				if err != nil || node == nil {
-					continue
-				}
-				nodeFqn, _ := node["fqn"].(string)
-				nodeType, _ := node["type"].(string)
-				if i > 0 {
-					sb.WriteString(" -> ")
-				}
-				sb.WriteString(fmt.Sprintf("[%s] %s", nodeType, nodeFqn))
-			}
-			return sb.String(), nil
-		}
-
-		neighbors, err := gdb.GetNeighbors(current)
-		if err == nil {
-			for _, n := range neighbors {
-				nID := n["id"].(string)
-				if !visited[nID] {
-					visited[nID] = true
-					newPath := append([]string(nil), path...)
-					newPath = append(newPath, nID)
-					queue = append(queue, newPath)
-				}
-			}
-		}
-	}
-	return fmt.Sprintf("No path found between '%s' and '%s'.", sourceFqn, targetFqn), nil
 }

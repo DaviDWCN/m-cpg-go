@@ -392,7 +392,7 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 // GetNeighbors retrieves neighboring nodes (nodes connected to the current node)
 func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 	query := `
-	SELECT DISTINCT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties
+	SELECT DISTINCT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties, e.label
 	FROM nodes n
 	JOIN edges e ON (e.source = n.id AND e.target = ?) OR (e.target = n.id AND e.source = ?)
 	WHERE n.id != ?;
@@ -405,8 +405,8 @@ func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 
 	var neighbors []map[string]any
 	for rows.Next() {
-		var id, nodeType, name, fqn, code, docstring, projectID, propsJSON string
-		if err := rows.Scan(&id, &nodeType, &name, &fqn, &code, &docstring, &projectID, &propsJSON); err != nil {
+		var id, nodeType, name, fqn, code, docstring, projectID, propsJSON, relation string
+		if err := rows.Scan(&id, &nodeType, &name, &fqn, &code, &docstring, &projectID, &propsJSON, &relation); err != nil {
 			return nil, err
 		}
 		var props map[string]any
@@ -423,6 +423,7 @@ func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 			"docstring":  docstring,
 			"project_id": projectID,
 			"properties": props,
+			"relation":   relation,
 		})
 	}
 	if err := rows.Err(); err != nil {
