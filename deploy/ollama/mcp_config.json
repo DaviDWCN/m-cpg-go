@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "m-cpg-go-ollama": {
+      "command": "C:\\path\\to\\deploy\\ollama\\m-cpg-go.exe",
+      "args": ["mcp"],
+      "env": {
+        "M_CPG_DB_PATH": "C:\\path\\to\\your\\project\\.m-cpg\\m_cpg.db",
+        "M_CPG_PROJECT_ID": "your-project-id",
+        "M_CPG_LLM_PROVIDER": "ollama",
+        "M_CPG_LLM_MODEL": "llama3",
+        "M_CPG_LLM_ENDPOINT": "http://localhost:11434/v1",
+        "M_CPG_LLM_API_KEY": "ollama",
+        "M_CPG_EMBEDDING_PROVIDER": "ollama",
+        "M_CPG_EMBEDDING_MODEL": "nomic-embed-text",
+        "M_CPG_EMBEDDING_ENDPOINT": "http://localhost:11434/v1",
+        "M_CPG_EMBEDDING_API_KEY": "ollama",
+        "M_CPG_EMBEDDING_DIMENSION": "768"
+      }
+    }
+  }
+}
