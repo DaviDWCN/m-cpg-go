@@ -323,7 +323,25 @@ public class CustomerService implements Service {
      */
     public void createCustomer(String name, int age) throws IOException {
         System.out.println("Customer created");
+		helperMethod();
     }
+
+	void helperMethod() {
+		// package private method
+	}
+}
+
+class InternalHelper {
+	public InternalHelper() {} // constructor
+
+	@Override
+	public String toString() {
+		return "InternalHelper";
+	}
+}
+
+interface MyInterface {
+	void interfaceMethod();
 }
 `
 	filePath := filepath.Join(tmpDir, "CustomerService.java")
@@ -340,6 +358,10 @@ public class CustomerService implements Service {
 	foundModule := false
 	foundClass := false
 	foundMethod := false
+	foundPackagePrivateClass := false
+	foundConstructor := false
+	foundInterface := false
+	foundInterfaceMethod := false
 
 	for _, ent := range entities {
 		switch ent.Type {
@@ -350,6 +372,10 @@ public class CustomerService implements Service {
 		case "Class":
 			if ent.Name == "CustomerService" && ent.FQN == "com.example.service.CustomerService" {
 				foundClass = true
+			} else if ent.Name == "InternalHelper" {
+				foundPackagePrivateClass = true
+			} else if ent.Name == "MyInterface" {
+				foundInterface = true
 			}
 		case "Method":
 			if ent.Name == "createCustomer" && ent.FQN == "com.example.service.CustomerService.createCustomer" {
@@ -357,22 +383,93 @@ public class CustomerService implements Service {
 				if !strings.Contains(ent.Docstring, "Creates a new customer.") {
 					t.Errorf("expected docstring to contain description, got '%s'", ent.Docstring)
 				}
+			} else if ent.Name == "InternalHelper" {
+				foundConstructor = true
+			} else if ent.Name == "interfaceMethod" {
+				foundInterfaceMethod = true
 			}
 		}
 	}
 
-	if !foundModule || !foundClass || !foundMethod {
-		t.Fatalf("failed to extract Java structures: module=%t, class=%t, method=%t",
-			foundModule, foundClass, foundMethod)
+	if !foundModule || !foundClass || !foundMethod || !foundPackagePrivateClass || !foundConstructor || !foundInterface || !foundInterfaceMethod {
+		t.Fatalf("failed to extract Java structures: module=%t, class=%t, method=%t, pkgPrivateClass=%t, constructor=%t, interface=%t, interfaceMethod=%t",
+			foundModule, foundClass, foundMethod, foundPackagePrivateClass, foundConstructor, foundInterface, foundInterfaceMethod)
 	}
 
 	foundContains := false
+	foundCallsPrintln := false
+	foundCallsHelper := false
 	for _, rel := range relations {
 		if rel.Source == "class_com.example.service.CustomerService" && rel.Target == "method_com.example.service.CustomerService.createCustomer" && rel.Label == "CONTAINS" {
 			foundContains = true
 		}
+		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "call_println" && rel.Label == "CALLS" {
+			foundCallsPrintln = true
+		}
+		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "call_helperMethod" && rel.Label == "CALLS" {
+			foundCallsHelper = true
+		}
 	}
 	if !foundContains {
 		t.Errorf("failed to extract Java CONTAINS relation")
+	}
+	if !foundCallsPrintln || !foundCallsHelper {
+		t.Errorf("failed to extract Java CALLS relations: println=%t, helperMethod=%t", foundCallsPrintln, foundCallsHelper)
+	}
+}
+
+func TestParseJavaFileRegression(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "m-cpg-parser-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	javaCode := `
+package com.example;
+
+class MyClass {
+    public int compute() {
+		return 42;
+	}
+
+    void myMethod() {
+		System.out.println("Hello");
+		anotherMethod();
+		if (true) {}
+		return compute();
+		throw new Exception();
+	}
+}
+`
+	filePath := filepath.Join(tmpDir, "MyClass.java")
+	err = os.WriteFile(filePath, []byte(javaCode), 0644)
+	if err != nil {
+		t.Fatalf("failed to write java file: %v", err)
+	}
+
+	entities, relations, err := ParseFile(filePath, "test-proj", tmpDir)
+	if err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+
+	for _, ent := range entities {
+		if ent.Type == "Method" {
+			if ent.Name == "Exception" || ent.Name == "compute" && ent.FQN != "com.example.MyClass.compute" {
+				t.Errorf("extracted invalid method from statement: %s", ent.Name)
+			}
+		}
+	}
+
+	// Verify CALLS relation from myMethod to compute
+	foundComputeCall := false
+	for _, rel := range relations {
+		if rel.Source == "method_com.example.MyClass.myMethod" && rel.Target == "call_compute" && rel.Label == "CALLS" {
+			foundComputeCall = true
+		}
+	}
+
+	if !foundComputeCall {
+		t.Errorf("failed to extract CALLS relation to compute")
 	}
 }
