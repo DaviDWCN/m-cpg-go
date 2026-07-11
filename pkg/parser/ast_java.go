@@ -52,7 +52,7 @@ func ParseJavaFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRela
 	})
 
 	// 2. Extract Classes/Interfaces/Enums
-	classRegex := regexp.MustCompile(`(?:public|protected|private|static|abstract|final)\s+(class|interface|enum)\s+([a-zA-Z0-9_]+)`)
+	classRegex := regexp.MustCompile(`(?:(?:public|protected|private|static|abstract|final|sealed|non-sealed|strictfp)\s+)*(class|interface|enum|record)\s+([a-zA-Z0-9_]+)`)
 	classMatches := classRegex.FindAllStringSubmatchIndex(codeStr, -1)
 
 	classIDMap := make(map[string]string) // name -> ID
@@ -111,21 +111,40 @@ func ParseJavaFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRela
 	}
 
 	// 3. Extract Methods
-	methodRegex := regexp.MustCompile(`(?:public|protected|private|static|final|synchronized)\s+[\w\<\>\[\]]+\s+(\w+)\s*\(([^\)]*)\)\s*(?:throws\s+[\w\s,]+)?\s*\{`)
-	methodMatches := methodRegex.FindAllStringSubmatchIndex(codeStr, -1)
+	// Enforce start of line (possibly with whitespace) to avoid matching method calls as method declarations.
+	methodRegex := regexp.MustCompile(`(?m)^[ \t]*(?:(?:public|protected|private|static|final|synchronized|abstract|default|native|strictfp)\s+)*(?:[\w\<\>\[\]\,\?\.\s]+\s+)?([a-zA-Z0-9_]+)\s*\(([^\)]*)\)\s*(?:throws\s+[\w\s,\.]+)?\s*(?:\{|;)`)
+	methodMatchesRaw := methodRegex.FindAllStringSubmatchIndex(codeStr, -1)
 
-	for _, matchIdx := range methodMatches {
-		nameStart, nameEnd := matchIdx[2], matchIdx[3]
-		paramsStart, paramsEnd := matchIdx[4], matchIdx[5]
-
-		if nameStart == -1 || nameEnd == -1 {
+	var methodMatches [][]int
+	for _, matchIdx := range methodMatchesRaw {
+		if matchIdx[2] == -1 || matchIdx[3] == -1 {
 			continue
 		}
-
-		methodName := codeStr[nameStart:nameEnd]
+		methodName := codeStr[matchIdx[2]:matchIdx[3]]
 		if methodName == "if" || methodName == "for" || methodName == "while" || methodName == "switch" || methodName == "catch" {
 			continue
 		}
+
+		fullMatch := codeStr[matchIdx[0]:matchIdx[1]]
+
+		// Filter out statement calls mistakenly captured as method declarations (e.g., return compute();, throw new Exception();)
+		statementRegex := regexp.MustCompile(`(?m)^[ \t]*(return|throw|new)\b`)
+		if statementRegex.MatchString(fullMatch) {
+			continue
+		}
+
+		isCallRegex := regexp.MustCompile(`(?m)^[ \t]*[a-zA-Z0-9_]+\s*\([^)]*\)\s*;`)
+		if isCallRegex.MatchString(fullMatch) {
+			continue
+		}
+		methodMatches = append(methodMatches, matchIdx)
+	}
+
+	for i, matchIdx := range methodMatches {
+		nameStart, nameEnd := matchIdx[2], matchIdx[3]
+		paramsStart, paramsEnd := matchIdx[4], matchIdx[5]
+
+		methodName := codeStr[nameStart:nameEnd]
 
 		params := ""
 		if paramsStart != -1 && paramsEnd != -1 {
@@ -161,6 +180,33 @@ func ParseJavaFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRela
 
 		methodDeclPos := matchIdx[0]
 		methodCode := codeStr[methodDeclPos:]
+
+		nextPos := len(codeStr)
+		if i+1 < len(methodMatches) {
+			nextPos = methodMatches[i+1][0]
+		}
+
+		methodChunk := codeStr[methodDeclPos:nextPos]
+		if len(methodChunk) > 1500 {
+			methodChunk = methodChunk[:1500]
+		}
+
+		// Extract Calls
+		callRegex := regexp.MustCompile(`([a-zA-Z0-9_]+)\s*\(`)
+		callMatches := callRegex.FindAllStringSubmatch(methodChunk, -1)
+		for _, m := range callMatches {
+			if len(m) > 1 {
+				targetName := m[1]
+				if !isJavaKeyword(targetName) && targetName != methodName {
+					relations = append(relations, CodeRelation{
+						Source: methodID,
+						Target: "call_" + targetName,
+						Label:  "CALLS",
+					})
+				}
+			}
+		}
+
 		if len(methodCode) > 800 {
 			methodCode = methodCode[:800] + "\n... [omitted]"
 		}
@@ -184,6 +230,14 @@ func ParseJavaFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRela
 	}
 
 	return entities, AggregateRelations(relations), nil
+}
+
+func isJavaKeyword(word string) bool {
+	keywords := map[string]bool{
+		"if": true, "for": true, "while": true, "switch": true, "catch": true,
+		"super": true, "this": true, "return": true, "new": true, "synchronized": true,
+	}
+	return keywords[word]
 }
 
 func cleanJavaDoc(doc string) string {
