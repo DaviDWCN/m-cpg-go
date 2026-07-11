@@ -915,8 +915,15 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			return err
 		}
 		if info.IsDir() {
-			// Skip hidden dirs
-			if strings.HasPrefix(info.Name(), ".") && info.Name() != "." {
+			name := info.Name()
+			// Skip hidden dirs and build/dependency folders
+			if (strings.HasPrefix(name, ".") && name != ".") ||
+				name == "target" ||
+				name == "node_modules" ||
+				name == "build" ||
+				name == "dist" ||
+				name == "bin" ||
+				name == "vendor" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -1084,6 +1091,9 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	}
 
 	for i, ent := range parsedEntities {
+		if ent.Type == "Method" {
+			continue // Skip calculating embeddings for methods to prevent database bloat
+		}
 		embedText := ent.Docstring
 		if embedText == "" {
 			if len(ent.Code) > 1000 {

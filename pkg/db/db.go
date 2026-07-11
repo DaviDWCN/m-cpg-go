@@ -84,7 +84,7 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	pragmas := []string{
 		"PRAGMA foreign_keys=ON;",
 		"PRAGMA journal_mode=WAL;",
-		"PRAGMA synchronous=NORMAL;",
+		"PRAGMA synchronous=OFF;",
 		"PRAGMA temp_store=MEMORY;",
 		"PRAGMA cache_size=-20000;",
 		"PRAGMA busy_timeout=5000;",
