@@ -57,6 +57,8 @@ func ParseFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelation
 		return ParseMarkdownFile(filePath, projectID, srcDir)
 	case ".ts", ".tsx", ".js", ".jsx":
 		return ParseTSFile(filePath, projectID, srcDir)
+	case ".java":
+		return ParseJavaFile(filePath, projectID, srcDir)
 	default:
 		return nil, nil, fmt.Errorf("unsupported file extension: %s", ext)
 	}

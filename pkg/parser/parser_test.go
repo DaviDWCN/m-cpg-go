@@ -298,3 +298,81 @@ async function doSomething() {
 		t.Errorf("failed to extract TS CALLS relation")
 	}
 }
+
+func TestParseJavaFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "m-cpg-parser-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	javaCode := `
+package com.example.service;
+
+import java.io.IOException;
+
+/**
+ * Service to manage customer operations.
+ */
+public class CustomerService implements Service {
+    
+    private String version = "1.0";
+
+    /**
+     * Creates a new customer.
+     */
+    public void createCustomer(String name, int age) throws IOException {
+        System.out.println("Customer created");
+    }
+}
+`
+	filePath := filepath.Join(tmpDir, "CustomerService.java")
+	err = os.WriteFile(filePath, []byte(javaCode), 0644)
+	if err != nil {
+		t.Fatalf("failed to write java file: %v", err)
+	}
+
+	entities, relations, err := ParseFile(filePath, "test-proj", tmpDir)
+	if err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+
+	foundModule := false
+	foundClass := false
+	foundMethod := false
+
+	for _, ent := range entities {
+		switch ent.Type {
+		case "Module":
+			if ent.Name == "CustomerService" && ent.FQN == "com.example.service.CustomerService" {
+				foundModule = true
+			}
+		case "Class":
+			if ent.Name == "CustomerService" && ent.FQN == "com.example.service.CustomerService" {
+				foundClass = true
+			}
+		case "Method":
+			if ent.Name == "createCustomer" && ent.FQN == "com.example.service.CustomerService.createCustomer" {
+				foundMethod = true
+				if !strings.Contains(ent.Docstring, "Creates a new customer.") {
+					t.Errorf("expected docstring to contain description, got '%s'", ent.Docstring)
+				}
+			}
+		}
+	}
+
+	if !foundModule || !foundClass || !foundMethod {
+		t.Fatalf("failed to extract Java structures: module=%t, class=%t, method=%t",
+			foundModule, foundClass, foundMethod)
+	}
+
+	foundContains := false
+	for _, rel := range relations {
+		if rel.Source == "class_com.example.service.CustomerService" && rel.Target == "method_com.example.service.CustomerService.createCustomer" && rel.Label == "CONTAINS" {
+			foundContains = true
+		}
+	}
+	if !foundContains {
+		t.Errorf("failed to extract Java CONTAINS relation")
+	}
+}

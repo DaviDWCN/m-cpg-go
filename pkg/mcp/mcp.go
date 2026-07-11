@@ -909,7 +909,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		return 0, 0, 0, err
 	}
 
-	var pyFiles, goFiles, mdFiles []string
+	var pyFiles, goFiles, mdFiles, javaFiles []string
 	err := filepath.Walk(projectPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -930,6 +930,8 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			goFiles = append(goFiles, path)
 		case ".md":
 			mdFiles = append(mdFiles, path)
+		case ".java":
+			javaFiles = append(javaFiles, path)
 		}
 		return nil
 	})
@@ -937,7 +939,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		return 0, 0, 0, err
 	}
 
-	allFiles := append(append(pyFiles, goFiles...), mdFiles...)
+	allFiles := append(append(append(pyFiles, goFiles...), mdFiles...), javaFiles...)
 	
 	// Get stored files
 	storedFiles, err := gdb.GetProjectFiles(projectID)
