@@ -39,6 +39,7 @@ func ParseGoFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelati
 		FQN:       moduleFqn,
 		Code:      string(content),
 		Docstring: getCommentGroupText(fileAST.Doc),
+		FilePath:  filePath,
 	})
 
 	// Keep track of declared Structs to build relations
@@ -82,6 +83,7 @@ func ParseGoFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelati
 				Code:      structCode,
 				Docstring: docstring,
 				ParentID:  moduleID,
+				FilePath:  filePath,
 			})
 
 			relations = append(relations, CodeRelation{
@@ -132,6 +134,7 @@ func ParseGoFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelati
 			Code:      funcCode,
 			Docstring: docstring,
 			ParentID:  parentID,
+			FilePath:  filePath,
 		})
 
 		relations = append(relations, CodeRelation{

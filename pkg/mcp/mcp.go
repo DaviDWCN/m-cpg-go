@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"bufio"
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,8 +65,56 @@ type mcpToolCallResult struct {
 	Content []mcpContent `json:"content"`
 }
 
+// VerifyEmbeddingConfig checks if the active embedding configuration matches the DB's initialized configuration
+func VerifyEmbeddingConfig(gdb *db.GraphDB, cfg *config.Config) error {
+	storedProvider, err := gdb.GetConfigMeta("embedding_provider")
+	if err != nil {
+		return fmt.Errorf("failed to read embedding config from DB: %w", err)
+	}
+
+	if storedProvider == "" {
+		// First-time DB initialization, store current config values
+		return gdb.RunInTransaction(func(tx *sql.Tx) error {
+			if err := gdb.SaveConfigMeta(tx, "embedding_provider", cfg.Embedding.Provider); err != nil {
+				return err
+			}
+			if err := gdb.SaveConfigMeta(tx, "embedding_model", cfg.Embedding.Model); err != nil {
+				return err
+			}
+			if err := gdb.SaveConfigMeta(tx, "embedding_dimension", fmt.Sprintf("%d", cfg.Embedding.Dimension)); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+
+	storedModel, _ := gdb.GetConfigMeta("embedding_model")
+	storedDimStr, _ := gdb.GetConfigMeta("embedding_dimension")
+
+	if storedProvider != cfg.Embedding.Provider || storedModel != cfg.Embedding.Model || storedDimStr != fmt.Sprintf("%d", cfg.Embedding.Dimension) {
+		return fmt.Errorf("embedding model mismatch: database was initialized with %s (model: %s, dim: %s) but currently configured to %s (model: %s, dim: %d). Please clear/reset your database or restore configuration",
+			storedProvider, storedModel, storedDimStr, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Dimension)
+	}
+
+	return nil
+}
+
+func computeFileMD5(filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	hash := md5.Sum(data)
+	return hex.EncodeToString(hash[:]), nil
+}
+
 func StartServer(gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config) error {
 	fmt.Fprintln(os.Stderr, "[MCP] Starting m-cpg-go stdio server...")
+
+	// Validate configuration
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return err
+	}
 
 	// Start Tiering GC background worker
 	go func() {
@@ -601,10 +651,11 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 
 	case "m_cpg_remember":
 		var params struct {
-			Summary    string `json:"summary"`
-			Details    string `json:"details"`
-			EventType  string `json:"event_type"`
-			Importance *int   `json:"importance,omitempty"`
+			Summary    string  `json:"summary"`
+			Details    string  `json:"details"`
+			EventType  string  `json:"event_type"`
+			Importance *int    `json:"importance,omitempty"`
+			ProjectID  *string `json:"project_id,omitempty"`
 		}
 		if err := json.Unmarshal(args, &params); err != nil {
 			return nil, err
@@ -615,7 +666,12 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 			importance = *params.Importance
 		}
 
-		err := RunRemember(params.Summary, params.Details, params.EventType, importance, gdb, cfg)
+		projectID := cfg.ProjectID
+		if params.ProjectID != nil && *params.ProjectID != "" {
+			projectID = *params.ProjectID
+		}
+
+		err := RunRemember(params.Summary, params.Details, params.EventType, importance, projectID, gdb, cfg)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to save memory: %v", err)}},
@@ -627,8 +683,9 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 
 	case "m_cpg_search_memory":
 		var params struct {
-			Query string `json:"query"`
-			Limit *int   `json:"limit,omitempty"`
+			Query     string  `json:"query"`
+			Limit     *int    `json:"limit,omitempty"`
+			ProjectID *string `json:"project_id,omitempty"`
 		}
 		if err := json.Unmarshal(args, &params); err != nil {
 			return nil, err
@@ -638,7 +695,12 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 			limit = *params.Limit
 		}
 
-		res, err := RunSearchMemory(params.Query, limit, gdb, cfg)
+		projectID := cfg.ProjectID
+		if params.ProjectID != nil && *params.ProjectID != "" {
+			projectID = *params.ProjectID
+		}
+
+		res, err := RunSearchMemory(params.Query, limit, projectID, gdb, cfg)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to search memory: %v", err)}},
@@ -668,7 +730,8 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		}, nil
 
 	case "m_cpg_get_preferences":
-		res, err := RunGetPreferences(gdb)
+		projectID := cfg.ProjectID
+		res, err := RunGetPreferences(gdb, projectID)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to fetch preferences: %v", err)}},
@@ -699,7 +762,8 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 	case "m_cpg_kb_bootstrap":
 		// kb_bootstrap essentially aliases getting the hot context, but sets the semantic expectation
 		// for agent initialization logic as defined in the Knowledge Base docs.
-		res, err := RunGetHotContext(gdb)
+		projectID := cfg.ProjectID
+		res, err := RunGetHotContext(gdb, projectID)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to bootstrap KB: %v", err)}},
@@ -715,8 +779,9 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 
 	case "m_cpg_ingest_conversation":
 		var params struct {
-			Transcript string `json:"transcript"`
-			Summary    string `json:"summary"`
+			Transcript string  `json:"transcript"`
+			Summary    string  `json:"summary"`
+			ProjectID  *string `json:"project_id,omitempty"`
 		}
 		if err := json.Unmarshal(args, &params); err != nil {
 			return nil, fmt.Errorf("invalid arguments: %v", err)
@@ -725,7 +790,12 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 			return nil, fmt.Errorf("transcript and summary are required")
 		}
 
-		res, err := RunIngestConversation(gdb, cfg, params.Transcript, params.Summary)
+		projectID := cfg.ProjectID
+		if params.ProjectID != nil && *params.ProjectID != "" {
+			projectID = *params.ProjectID
+		}
+
+		res, err := RunIngestConversation(gdb, cfg, params.Transcript, params.Summary, projectID)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to ingest conversation: %v", err)}},
@@ -736,7 +806,8 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		}, nil
 
 	case "m_cpg_get_hot_context":
-		res, err := RunGetHotContext(gdb)
+		projectID := cfg.ProjectID
+		res, err := RunGetHotContext(gdb, projectID)
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to get hot context: %v", err)}},
@@ -833,6 +904,11 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 }
 
 func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config) (int, int, int, error) {
+	// Validate configuration
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return 0, 0, 0, err
+	}
+
 	var pyFiles, goFiles, mdFiles []string
 	err := filepath.Walk(projectPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -862,12 +938,82 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	}
 
 	allFiles := append(append(pyFiles, goFiles...), mdFiles...)
-	fmt.Fprintf(os.Stderr, "[MCP] Found %d files to analyze (Python, Go, Markdown).\n", len(allFiles))
+	
+	// Get stored files
+	storedFiles, err := gdb.GetProjectFiles(projectID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to retrieve stored file hashes: %w", err)
+	}
 
-	// 1. Parse all files first in CPU memory (very fast)
+	foundPaths := make(map[string]bool)
+	var changedFiles []string
+	changedHashes := make(map[string]string)
+
+	for _, file := range allFiles {
+		foundPaths[file] = true
+		hash, err := computeFileMD5(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to compute hash for %s: %v\n", file, err)
+			changedFiles = append(changedFiles, file)
+			changedHashes[file] = ""
+			continue
+		}
+
+		storedHash, exists := storedFiles[file]
+		if !exists || storedHash != hash {
+			changedFiles = append(changedFiles, file)
+			changedHashes[file] = hash
+		}
+	}
+
+	// Find deleted files
+	var deletedFiles []string
+	for file := range storedFiles {
+		if !foundPaths[file] {
+			deletedFiles = append(deletedFiles, file)
+		}
+	}
+
+	if len(changedFiles) == 0 && len(deletedFiles) == 0 {
+		fmt.Fprintln(os.Stderr, "[MCP] No changed or deleted files. Index is up to date.")
+		return len(allFiles), 0, 0, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "[MCP] Indexing project '%s': %d changed/new files, %d deleted files.\n", projectID, len(changedFiles), len(deletedFiles))
+
+	// Clean up database entries for changed and deleted files
+	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+		for _, file := range changedFiles {
+			if err := gdb.DeleteNodesByFile(tx, file, projectID); err != nil {
+				return err
+			}
+			if err := gdb.DeleteFileHash(tx, file, projectID); err != nil {
+				return err
+			}
+		}
+		for _, file := range deletedFiles {
+			if err := gdb.DeleteNodesByFile(tx, file, projectID); err != nil {
+				return err
+			}
+			if err := gdb.DeleteFileHash(tx, file, projectID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to prune stale index records: %w", err)
+	}
+
+	if len(changedFiles) == 0 {
+		// Only deletions occurred
+		return len(allFiles), 0, 0, nil
+	}
+
+	// 1. Parse changed files in CPU memory
 	var parsedEntities []parser.CodeEntity
 	var parsedRelations []parser.CodeRelation
-	for _, file := range allFiles {
+	for _, file := range changedFiles {
 		entities, relations, err := parser.ParseFile(file, projectID, projectPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to parse %s: %v\n", file, err)
@@ -878,7 +1024,19 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	}
 
 	if len(parsedEntities) == 0 {
-		return len(allFiles), 0, 0, nil
+		// Update hashes even if files parsed to empty
+		now := time.Now().Unix()
+		err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+			for _, file := range changedFiles {
+				if hash, ok := changedHashes[file]; ok && hash != "" {
+					if err := gdb.SaveFileHash(tx, file, projectID, hash, now); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+		return len(allFiles), 0, 0, err
 	}
 
 	// 2. Parallel embedding calculation using goroutines
@@ -968,7 +1126,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	nodesCount := 0
 	edgesCount := 0
 
-	// 3. Write all entries to database in batch transactions to avoid memory blowout
+	// 3. Write all entries to database in batch transactions
 	batchSize := 1000
 
 	// Insert nodes & vectors in batches
@@ -982,7 +1140,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		err = gdb.RunInTransaction(func(tx *sql.Tx) error {
 			for i, ent := range batchEntities {
 				globalIndex := batchStart + i
-				err = gdb.AddNode(tx, ent.ID, ent.Type, ent.Name, ent.FQN, ent.Code, ent.Docstring, projectID, nil)
+				err = gdb.AddNode(tx, ent.ID, ent.Type, ent.Name, ent.FQN, ent.Code, ent.Docstring, projectID, ent.FilePath, nil)
 				if err != nil {
 					return fmt.Errorf("failed to save node: %w", err)
 				}
@@ -1046,10 +1204,29 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		}
 	}
 
+	// 4. Update file hashes
+	now := time.Now().Unix()
+	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+		for _, file := range changedFiles {
+			if hash, ok := changedHashes[file]; ok && hash != "" {
+				if err := gdb.SaveFileHash(tx, file, projectID, hash, now); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to save new file hashes: %w", err)
+	}
+
 	return len(allFiles), nodesCount, edgesCount, nil
 }
 
 func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorStore, cfg *config.Config) (string, error) {
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return "", err
+	}
 	// 1. Get embedding for the query
 	emb, err := vector.GetEmbedding(
 		query,
@@ -1185,7 +1362,7 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 
 	// 3. Search Memory Events (The kb_search aspect)
 	// We use the topK for memory events as well
-	memResult, _ := RunSearchMemory(query, topK, gdb, cfg)
+	memResult, _ := RunSearchMemory(query, topK, cfg.ProjectID, gdb, cfg)
 	if memResult != "No active memories found matching the query." {
 		sb.WriteString("## Episodic / Semantic Memories:\n")
 		// Strip the "Found X memories matching 'query':\n\n" header from RunSearchMemory output
@@ -1308,7 +1485,11 @@ func RunGetFileStructure(filePath, projectID string, gdb *db.GraphDB) (string, e
 }
 
 // RunSearchMemory retrieves active events related to the query using vector similarity
-func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Config) (string, error) {
+// RunSearchMemory retrieves active events related to the query using vector similarity
+func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB, cfg *config.Config) (string, error) {
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return "", err
+	}
 	emb, err := vector.GetEmbedding(
 		query,
 		cfg.Embedding.Provider,
@@ -1321,7 +1502,7 @@ func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Confi
 		return "", fmt.Errorf("failed to embed query: %w", err)
 	}
 
-	events, err := gdb.GetAllActiveEvents()
+	events, err := gdb.GetAllActiveEvents(projectID)
 	if err != nil {
 		return "", fmt.Errorf("failed to retrieve active events: %w", err)
 	}
@@ -1388,7 +1569,10 @@ func RunSearchMemory(query string, limit int, gdb *db.GraphDB, cfg *config.Confi
 }
 
 // RunRemember saves a developer preference, compilation fix, or session log to the DB and generates vector embedding.
-func RunRemember(summary, details, eventType string, importance int, gdb *db.GraphDB, cfg *config.Config) error {
+func RunRemember(summary, details, eventType string, importance int, projectID string, gdb *db.GraphDB, cfg *config.Config) error {
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return err
+	}
 	id := uuid.New().String()
 	timestamp := time.Now().Unix()
 
@@ -1408,7 +1592,7 @@ func RunRemember(summary, details, eventType string, importance int, gdb *db.Gra
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
-	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active", importance)
+	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active", importance, projectID)
 	if err != nil {
 		return fmt.Errorf("failed to save memory to DB: %w", err)
 	}
@@ -1448,7 +1632,10 @@ func RunGetConceptHierarchy(limit int, gdb *db.GraphDB) (string, error) {
 }
 
 // RunIngestConversation ingests a transcript chunk as an event (Cold Layer proxy)
-func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summary string) (string, error) {
+func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summary string, projectID string) (string, error) {
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return "", err
+	}
 	err := gdb.RunInTransaction(func(tx *sql.Tx) error {
 		id := "conv_" + uuid.New().String()
 		now := time.Now().Unix()
@@ -1467,7 +1654,7 @@ func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summ
 		}
 
 		// Save as an event with type 'conversation', importance 2 (default cold layer)
-		err = gdb.SaveEvent(tx, id, "conversation", summary, details, now, embBytes, "archived", 2)
+		err = gdb.SaveEvent(tx, id, "conversation", summary, details, now, embBytes, "archived", 2, projectID)
 		if err != nil {
 			return err
 		}
@@ -1482,8 +1669,8 @@ func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summ
 }
 
 // RunGetHotContext queries the most recent 5 active events and top 5 concepts to generate a dynamic hot context index
-func RunGetHotContext(gdb *db.GraphDB) (string, error) {
-	events, err := gdb.GetRecentActiveEvents(5)
+func RunGetHotContext(gdb *db.GraphDB, projectID string) (string, error) {
+	events, err := gdb.GetRecentActiveEvents(5, projectID)
 	if err != nil {
 		return "", err
 	}
@@ -1537,8 +1724,8 @@ func RunGetHotContext(gdb *db.GraphDB) (string, error) {
 }
 
 // RunGetPreferences queries the most recent 10 events from memory
-func RunGetPreferences(gdb *db.GraphDB) (string, error) {
-	events, err := gdb.GetRecentEvents(10)
+func RunGetPreferences(gdb *db.GraphDB, projectID string) (string, error) {
+	events, err := gdb.GetRecentEvents(10, projectID)
 	if err != nil {
 		return "", err
 	}

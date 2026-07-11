@@ -115,6 +115,10 @@ func ParseMarkdownFile(filePath, projectID, srcDir string) ([]CodeEntity, []Code
 		scopeStack = scopeStack[:len(scopeStack)-1]
 	}
 
+	for i := range entities {
+		entities[i].FilePath = filePath
+	}
+
 	return entities, AggregateRelations(relations), nil
 }
 

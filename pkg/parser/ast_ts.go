@@ -167,6 +167,10 @@ func ParseTSFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelati
 		}
 	}
 
+	for i := range entities {
+		entities[i].FilePath = filePath
+	}
+
 	return entities, AggregateRelations(relations), nil
 }
 

@@ -44,6 +44,16 @@ func TestE2ECLI(t *testing.T) {
 		if !strings.Contains(string(output), "SUCCESS: Indexing finished!") {
 			t.Errorf("Index output missing expected success message. Output: %s", string(output))
 		}
+
+		// Run again to test incremental indexing
+		cmd2 := exec.Command(binPath, "index", ".")
+		output2, err := cmd2.CombinedOutput()
+		if err != nil {
+			t.Fatalf("Failed to run incremental index: %v\nOutput: %s", err, string(output2))
+		}
+		if !strings.Contains(string(output2), "Graph Nodes Created: 0") || !strings.Contains(string(output2), "Relationships Created: 0") {
+			t.Errorf("Incremental index failed to skip unchanged files. Output: %s", string(output2))
+		}
 	})
 
 	t.Run("Search", func(t *testing.T) {

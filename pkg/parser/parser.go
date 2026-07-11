@@ -14,6 +14,7 @@ type CodeEntity struct {
 	Code      string
 	Docstring string
 	ParentID  string
+	FilePath  string
 }
 
 type CodeRelation struct {

@@ -41,12 +41,17 @@ func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRe
 
 	// Try the python ast approach first
 	entities, relations, err := parsePythonFileWithAST(string(fileContent), moduleFqn, moduleID)
-	if err == nil {
-		return entities, AggregateRelations(relations), nil
+	if err != nil {
+		// Fallback to regex-based parsing if Python is not available or script fails
+		entities, relations, err = parsePythonFileRegex(filePath, moduleFqn, moduleID)
 	}
 
-	// Fallback to regex-based parsing if Python is not available or script fails
-	entities, relations, err = parsePythonFileRegex(filePath, moduleFqn, moduleID)
+	if err == nil {
+		for i := range entities {
+			entities[i].FilePath = filePath
+		}
+	}
+
 	return entities, AggregateRelations(relations), err
 }
 

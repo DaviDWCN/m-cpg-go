@@ -26,13 +26,13 @@ func TestGraphDB_Operations(t *testing.T) {
 
 	// 1. Test AddNode
 	nodeID1 := "module_test_pkg"
-	err = gdb.AddNode(nil, nodeID1, "Module", "test_pkg", "test_pkg", "package test_pkg", "This is a test module", "project_1", map[string]any{"version": "1.0"})
+	err = gdb.AddNode(nil, nodeID1, "Module", "test_pkg", "test_pkg", "package test_pkg", "This is a test module", "project_1", "test.go", map[string]any{"version": "1.0"})
 	if err != nil {
 		t.Errorf("failed to add node 1: %v", err)
 	}
 
 	nodeID2 := "class_Calculator"
-	err = gdb.AddNode(nil, nodeID2, "Class", "Calculator", "test_pkg.Calculator", "type Calculator struct{}", "Calculates things", "project_1", nil)
+	err = gdb.AddNode(nil, nodeID2, "Class", "Calculator", "test_pkg.Calculator", "type Calculator struct{}", "Calculates things", "project_1", "test.go", nil)
 	if err != nil {
 		t.Errorf("failed to add node 2: %v", err)
 	}
@@ -118,9 +118,9 @@ func TestQueryPattern(t *testing.T) {
 
 	// Seed data
 	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
-		gdb.AddNode(tx, "m1", "Method", "FuncA", "pkg.FuncA", "", "", "proj", nil)
-		gdb.AddNode(tx, "m2", "Method", "FuncB", "pkg.FuncB", "", "", "proj", nil)
-		gdb.AddNode(tx, "c1", "Class", "ClassA", "pkg.ClassA", "", "", "proj", nil)
+		gdb.AddNode(tx, "m1", "Method", "FuncA", "pkg.FuncA", "", "", "proj", "pkg.go", nil)
+		gdb.AddNode(tx, "m2", "Method", "FuncB", "pkg.FuncB", "", "", "proj", "pkg.go", nil)
+		gdb.AddNode(tx, "c1", "Class", "ClassA", "pkg.ClassA", "", "", "proj", "pkg.go", nil)
 
 		gdb.AddEdge(tx, "m1", "m2", "CALLS", map[string]any{"weight": 2})
 		gdb.AddEdge(tx, "c1", "m1", "CONTAINS", nil)
@@ -162,7 +162,7 @@ func TestQueryPattern(t *testing.T) {
 
 	// Seed multihop data
 	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
-		gdb.AddNode(tx, "m3", "Method", "FuncC", "pkg.FuncC", "", "", "proj", nil)
+		gdb.AddNode(tx, "m3", "Method", "FuncC", "pkg.FuncC", "", "", "proj", "pkg.go", nil)
 		gdb.AddEdge(tx, "m2", "m3", "CALLS", nil)
 		return nil
 	})

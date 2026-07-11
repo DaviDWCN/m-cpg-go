@@ -105,10 +105,18 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		code TEXT,
 		docstring TEXT,
 		project_id TEXT,
-		properties TEXT
+		properties TEXT,
+		file_path TEXT
 	);`
 	if _, err := g.db.Exec(createNodesTable); err != nil {
 		return fmt.Errorf("failed to create nodes table: %w", err)
+	}
+
+	// Handle migration for existing nodes table
+	alterNodesTableFilePath := `ALTER TABLE nodes ADD COLUMN file_path TEXT;`
+	_, alterNodesErr := g.db.Exec(alterNodesTableFilePath)
+	if alterNodesErr != nil && !strings.Contains(alterNodesErr.Error(), "duplicate column name") {
+		fmt.Printf("[DB] Note: Could not alter nodes table file_path column: %v\n", alterNodesErr)
 	}
 
 	// Create edges table
@@ -141,6 +149,10 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		return fmt.Errorf("failed to create vectors meta table: %w", err)
 	}
 
+	// Note: We do NOT use an SQLite trigger here to clean up virtual table "vectors".
+	// SQLite restricts modifying virtual tables from nested triggers during foreign key cascade deletes
+	// and flags it as "unsafe use of virtual table". Instead, we perform manual cleanups.
+
 	// Create events table for developer preferences and session logs
 	createEventsTable := `
 	CREATE TABLE IF NOT EXISTS events (
@@ -150,20 +162,19 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		summary TEXT NOT NULL,
 		details TEXT,
 		embedding BLOB NOT NULL,
-		status TEXT NOT NULL DEFAULT 'active'
+		status TEXT NOT NULL DEFAULT 'active',
+		importance INTEGER NOT NULL DEFAULT 0,
+		last_accessed INTEGER NOT NULL DEFAULT 0,
+		project_id TEXT NOT NULL DEFAULT 'global'
 	);`
 	if _, err := g.db.Exec(createEventsTable); err != nil {
 		return fmt.Errorf("failed to create events table: %w", err)
 	}
 
 	// Handle migration for existing events table
-	// SQLite ALTER TABLE ADD COLUMN does not support IF NOT EXISTS in all versions natively without checking.
-	// We run it and safely ignore the "duplicate column name" error.
 	alterEventsTable := `ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'active';`
 	_, alterErr := g.db.Exec(alterEventsTable)
 	if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
-		// Only log or ignore, do not fail completely if it's already there or something similar.
-		// A fatal failure would prevent the app from starting.
 		fmt.Printf("[DB] Note: Could not alter events table status column: %v\n", alterErr)
 	}
 
@@ -177,6 +188,34 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	_, alterErrAcc := g.db.Exec(alterEventsTableAcc)
 	if alterErrAcc != nil && !strings.Contains(alterErrAcc.Error(), "duplicate column name") {
 		fmt.Printf("[DB] Note: Could not alter events table last_accessed column: %v\n", alterErrAcc)
+	}
+
+	alterEventsTableProjectID := `ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT 'global';`
+	_, alterProjErr := g.db.Exec(alterEventsTableProjectID)
+	if alterProjErr != nil && !strings.Contains(alterProjErr.Error(), "duplicate column name") {
+		fmt.Printf("[DB] Note: Could not alter events table project_id column: %v\n", alterProjErr)
+	}
+
+	// Create file_hashes table for incremental indexing
+	createFileHashesTable := `
+	CREATE TABLE IF NOT EXISTS file_hashes (
+		file_path TEXT PRIMARY KEY,
+		project_id TEXT NOT NULL,
+		hash TEXT NOT NULL,
+		last_indexed INTEGER NOT NULL
+	);`
+	if _, err := g.db.Exec(createFileHashesTable); err != nil {
+		return fmt.Errorf("failed to create file_hashes table: %w", err)
+	}
+
+	// Create config_meta table for configuration validation
+	createConfigMetaTable := `
+	CREATE TABLE IF NOT EXISTS config_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);`
+	if _, err := g.db.Exec(createConfigMetaTable); err != nil {
+		return fmt.Errorf("failed to create config_meta table: %w", err)
 	}
 
 	// Create concepts table
@@ -207,10 +246,13 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		"CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_fqn ON nodes(fqn);",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_id);",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);",
 		"CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);",
 		"CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);",
 		"CREATE INDEX IF NOT EXISTS idx_edges_label ON edges(label);",
 		"CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);",
+		"CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);",
+		"CREATE INDEX IF NOT EXISTS idx_file_hashes_project ON file_hashes(project_id);",
 		"CREATE INDEX IF NOT EXISTS idx_concepts_freq ON concepts(frequency DESC);",
 	}
 
@@ -224,7 +266,7 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 }
 
 // AddNode inserts or replaces a node in the graph
-func (g *GraphDB) AddNode(tx *sql.Tx, id, nodeType, name, fqn, code, docstring, projectID string, props map[string]any) error {
+func (g *GraphDB) AddNode(tx *sql.Tx, id, nodeType, name, fqn, code, docstring, projectID, filePath string, props map[string]any) error {
 	propsJSON := "{}"
 	if len(props) > 0 {
 		data, err := json.Marshal(props)
@@ -235,11 +277,11 @@ func (g *GraphDB) AddNode(tx *sql.Tx, id, nodeType, name, fqn, code, docstring, 
 	}
 
 	query := `
-	INSERT OR REPLACE INTO nodes (id, type, name, fqn, code, docstring, project_id, properties)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+	INSERT OR REPLACE INTO nodes (id, type, name, fqn, code, docstring, project_id, file_path, properties)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, id, nodeType, name, fqn, code, docstring, projectID, propsJSON)
+	_, err := executor.Exec(query, id, nodeType, name, fqn, code, docstring, projectID, filePath, propsJSON)
 	if err != nil {
 		return fmt.Errorf("failed to add node: %w", err)
 	}
@@ -535,22 +577,63 @@ func (g *GraphDB) QueryNodes(nodeType, nameFilter, projectID string) ([]map[stri
 
 // ClearProject deletes all nodes and edges belonging to a project
 func (g *GraphDB) ClearProject(projectID string) error {
-	// First delete all edges connected to these nodes (SQLite CASCADE foreign keys handles this,
-	// but manual delete is safer in case foreign keys PRAGMA isn't fully enabled)
-	deleteEdges := `
-	DELETE FROM edges 
-	WHERE source IN (SELECT id FROM nodes WHERE project_id = ?)
-	   OR target IN (SELECT id FROM nodes WHERE project_id = ?);
-	`
-	if _, err := g.db.Exec(deleteEdges, projectID, projectID); err != nil {
-		return fmt.Errorf("failed to clear project edges: %w", err)
-	}
+	return g.RunInTransaction(func(tx *sql.Tx) error {
+		// Get all node IDs in the project
+		queryIDs := "SELECT id FROM nodes WHERE project_id = ?;"
+		rows, err := tx.Query(queryIDs, projectID)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		rows.Close()
 
-	deleteNodes := "DELETE FROM nodes WHERE project_id = ?;"
-	if _, err := g.db.Exec(deleteNodes, projectID); err != nil {
-		return fmt.Errorf("failed to clear project nodes: %w", err)
-	}
-	return nil
+		if len(ids) > 0 {
+			// Manually delete vectors from the virtual table
+			for _, id := range ids {
+				var rowid int64
+				err := tx.QueryRow("SELECT rowid FROM vectors_meta WHERE node_id = ?", id).Scan(&rowid)
+				if err == nil {
+					tx.Exec("DELETE FROM vectors WHERE rowid = ?", rowid)
+				}
+			}
+
+			// Delete metadata records from vectors_meta
+			placeholders := make([]string, len(ids))
+			args := make([]any, len(ids))
+			for i, id := range ids {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+			queryDeleteMeta := fmt.Sprintf("DELETE FROM vectors_meta WHERE node_id IN (%s);", strings.Join(placeholders, ","))
+			if _, err := tx.Exec(queryDeleteMeta, args...); err != nil {
+				return err
+			}
+		}
+
+		// Delete edges
+		deleteEdges := `
+		DELETE FROM edges 
+		WHERE source IN (SELECT id FROM nodes WHERE project_id = ?)
+		   OR target IN (SELECT id FROM nodes WHERE project_id = ?);
+		`
+		if _, err := tx.Exec(deleteEdges, projectID, projectID); err != nil {
+			return fmt.Errorf("failed to clear project edges: %w", err)
+		}
+
+		// Delete nodes
+		deleteNodes := "DELETE FROM nodes WHERE project_id = ?;"
+		if _, err := tx.Exec(deleteNodes, projectID); err != nil {
+			return fmt.Errorf("failed to clear project nodes: %w", err)
+		}
+
+		return nil
+	})
 }
 
 // SaveVector inserts or replaces a vector embedding associated with a node
@@ -625,13 +708,16 @@ func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 }
 
 // SaveEvent inserts a new event (preference, error fix, session log) in the database
-func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int) error {
+func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int, projectID string) error {
+	if projectID == "" {
+		projectID = "global"
+	}
 	query := `
-	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed, project_id)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance, timestamp)
+	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance, timestamp, projectID)
 	if err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
@@ -741,14 +827,17 @@ func (g *GraphDB) RunTieringGC(decayIntervalSeconds int64, currentTime int64) er
 }
 
 // GetAllActiveEvents retrieves all events where status = 'active'
-func (g *GraphDB) GetAllActiveEvents() ([]map[string]any, error) {
+func (g *GraphDB) GetAllActiveEvents(projectID string) ([]map[string]any, error) {
+	if projectID == "" {
+		projectID = "global"
+	}
 	query := `
 	SELECT id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed
 	FROM events
-	WHERE status = 'active'
+	WHERE status = 'active' AND (project_id = ? OR project_id = 'global')
 	ORDER BY importance DESC, timestamp DESC;
 	`
-	rows, err := g.db.Query(query)
+	rows, err := g.db.Query(query, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active events: %w", err)
 	}
@@ -803,15 +892,18 @@ func (g *GraphDB) ArchiveEvents(tx *sql.Tx, ids []string) error {
 }
 
 // GetRecentActiveEvents retrieves the most recent active events from the database
-func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
+func (g *GraphDB) GetRecentActiveEvents(limit int, projectID string) ([]map[string]any, error) {
+	if projectID == "" {
+		projectID = "global"
+	}
 	query := `
 	SELECT id, timestamp, event_type, summary, details, embedding, importance, last_accessed
 	FROM events
-	WHERE status = 'active'
+	WHERE status = 'active' AND (project_id = ? OR project_id = 'global')
 	ORDER BY importance DESC, timestamp DESC
 	LIMIT ?;
 	`
-	rows, err := g.db.Query(query, limit)
+	rows, err := g.db.Query(query, projectID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recent active events: %w", err)
 	}
@@ -845,14 +937,18 @@ func (g *GraphDB) GetRecentActiveEvents(limit int) ([]map[string]any, error) {
 }
 
 // GetRecentEvents retrieves the most recent events from the database
-func (g *GraphDB) GetRecentEvents(limit int) ([]map[string]any, error) {
+func (g *GraphDB) GetRecentEvents(limit int, projectID string) ([]map[string]any, error) {
+	if projectID == "" {
+		projectID = "global"
+	}
 	query := `
 	SELECT id, timestamp, event_type, summary, details, embedding, importance, last_accessed
 	FROM events
+	WHERE (project_id = ? OR project_id = 'global')
 	ORDER BY importance DESC, timestamp DESC
 	LIMIT ?;
 	`
-	rows, err := g.db.Query(query, limit)
+	rows, err := g.db.Query(query, projectID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recent events: %w", err)
 	}
@@ -1108,6 +1204,129 @@ func (g *GraphDB) QueryPattern(pattern string, maxDepth int) ([]map[string]any, 
 		}
 		results = append(results, res)
 	}
-
 	return results, nil
+}
+
+// FileHashRecord represents a record in the file_hashes table
+type FileHashRecord struct {
+	FilePath    string
+	ProjectID   string
+	Hash        string
+	LastIndexed int64
+}
+
+// GetFileHash retrieves the hash for a file path in a project
+func (g *GraphDB) GetFileHash(filePath, projectID string) (string, error) {
+	query := "SELECT hash FROM file_hashes WHERE file_path = ? AND project_id = ?;"
+	var hash string
+	err := g.db.QueryRow(query, filePath, projectID).Scan(&hash)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return hash, err
+}
+
+// SaveFileHash saves or updates a file hash
+func (g *GraphDB) SaveFileHash(tx *sql.Tx, filePath, projectID, hash string, timestamp int64) error {
+	query := `
+	INSERT OR REPLACE INTO file_hashes (file_path, project_id, hash, last_indexed)
+	VALUES (?, ?, ?, ?);
+	`
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(query, filePath, projectID, hash, timestamp)
+	return err
+}
+
+// DeleteFileHash deletes a file hash record
+func (g *GraphDB) DeleteFileHash(tx *sql.Tx, filePath, projectID string) error {
+	query := "DELETE FROM file_hashes WHERE file_path = ? AND project_id = ?;"
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(query, filePath, projectID)
+	return err
+}
+
+// DeleteNodesByFile deletes all nodes and their cascaded relations/vectors for a specific file in a project
+func (g *GraphDB) DeleteNodesByFile(tx *sql.Tx, filePath, projectID string) error {
+	executor := g.getExecutor(tx)
+	
+	// Get all node IDs in the file to clean up virtual table vectors manually
+	queryIDs := "SELECT id FROM nodes WHERE file_path = ? AND project_id = ?;"
+	rows, err := executor.Query(queryIDs, filePath, projectID)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+
+	if len(ids) > 0 {
+		// Manually delete vectors from the virtual table
+		for _, id := range ids {
+			var rowid int64
+			err := executor.QueryRow("SELECT rowid FROM vectors_meta WHERE node_id = ?", id).Scan(&rowid)
+			if err == nil {
+				executor.Exec("DELETE FROM vectors WHERE rowid = ?", rowid)
+			}
+		}
+
+		// Delete metadata records from vectors_meta
+		placeholders := make([]string, len(ids))
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		queryDeleteMeta := fmt.Sprintf("DELETE FROM vectors_meta WHERE node_id IN (%s);", strings.Join(placeholders, ","))
+		if _, err := executor.Exec(queryDeleteMeta, args...); err != nil {
+			return err
+		}
+	}
+
+	query := "DELETE FROM nodes WHERE file_path = ? AND project_id = ?;"
+	_, err = executor.Exec(query, filePath, projectID)
+	return err
+}
+
+// GetProjectFiles returns all indexed file paths for a project
+func (g *GraphDB) GetProjectFiles(projectID string) (map[string]string, error) {
+	query := "SELECT file_path, hash FROM file_hashes WHERE project_id = ?;"
+	rows, err := g.db.Query(query, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	files := make(map[string]string)
+	for rows.Next() {
+		var filePath, hash string
+		if err := rows.Scan(&filePath, &hash); err != nil {
+			return nil, err
+		}
+		files[filePath] = hash
+	}
+	return files, nil
+}
+
+// GetConfigMeta retrieves a configuration metadata value by key
+func (g *GraphDB) GetConfigMeta(key string) (string, error) {
+	query := "SELECT value FROM config_meta WHERE key = ?;"
+	var value string
+	err := g.db.QueryRow(query, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+// SaveConfigMeta saves or updates a configuration metadata key-value pair
+func (g *GraphDB) SaveConfigMeta(tx *sql.Tx, key, value string) error {
+	query := "INSERT OR REPLACE INTO config_meta (key, value) VALUES (?, ?);"
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(query, key, value)
+	return err
 }
