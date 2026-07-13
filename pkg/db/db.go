@@ -867,6 +867,47 @@ func (g *GraphDB) GetAllActiveEvents(projectID string) ([]map[string]any, error)
 	return events, nil
 }
 
+// GetStaleEvents retrieves events that have not been accessed since the given timestamp threshold
+func (g *GraphDB) GetStaleEvents(projectID string, accessedBefore int64) ([]map[string]any, error) {
+	query := `
+		SELECT id, event_type, summary, details, timestamp, last_accessed, importance
+		FROM events
+		WHERE status = 'active' AND last_accessed < ?
+	`
+	args := []any{accessedBefore}
+
+	if projectID != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+
+	rows, err := g.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []map[string]any
+	for rows.Next() {
+		var id, eventType, summary, details string
+		var timestamp, lastAccessed int64
+		var importance int
+		if err := rows.Scan(&id, &eventType, &summary, &details, &timestamp, &lastAccessed, &importance); err != nil {
+			return nil, err
+		}
+		events = append(events, map[string]any{
+			"id":            id,
+			"event_type":    eventType,
+			"summary":       summary,
+			"details":       details,
+			"timestamp":     timestamp,
+			"last_accessed": lastAccessed,
+			"importance":    importance,
+		})
+	}
+	return events, nil
+}
+
 // ArchiveEvents updates the status of the given event IDs to 'archived'
 func (g *GraphDB) ArchiveEvents(tx *sql.Tx, ids []string) error {
 	if len(ids) == 0 {
