@@ -1,6 +1,6 @@
 # m-cpg-go AI Coding Rules & Architecture Guidelines
 
-As an AI assistant working on this codebase, you must follow the principles of code simplicity, DRY (Don't Repeat Yourself), and active refactoring. 
+As an AI assistant working on this codebase, you must follow the principles of code simplicity, DRY (Don't Repeat Yourself), and active refactoring.
 
 ## 1. Prevent the "Refactoring Paradox" & Duplicate Code
 Before writing any new function, method, class, struct, or utility helper:
