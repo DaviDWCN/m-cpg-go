@@ -1219,7 +1219,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		embedText := ent.Docstring
 		if embedText == "" {
 			if len(ent.Code) > 1000 {
-				embedText = ent.Code[:1000]
+				embedText = truncateString(ent.Code, 1000)
 			} else {
 				embedText = ent.Code
 			}
@@ -1244,7 +1244,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			embedText := ent.Docstring
 			if embedText == "" {
 				if len(ent.Code) > 1000 {
-					embedText = ent.Code[:1000]
+					embedText = truncateString(ent.Code, 1000)
 				} else {
 					embedText = ent.Code
 				}
@@ -1540,7 +1540,7 @@ func RunLintMemory(daysStale int, projectID string, gdb *db.GraphDB) (string, er
 		sb.WriteString(fmt.Sprintf("%d. [ID: %s] Type: %s (Last Accessed: %s)\n", i+1, id, eventType, lastAccessed))
 		sb.WriteString(fmt.Sprintf("   Summary: %s\n", summary))
 		if len(details) > 150 {
-			sb.WriteString(fmt.Sprintf("   Details: %s...\n", strings.ReplaceAll(details[:150], "\n", " ")))
+			sb.WriteString(fmt.Sprintf("   Details: %s...\n", strings.ReplaceAll(truncateString(details, 150), "\n", " ")))
 		} else {
 			sb.WriteString(fmt.Sprintf("   Details: %s\n", strings.ReplaceAll(details, "\n", " ")))
 		}
@@ -1643,7 +1643,7 @@ func RunGetFileStructure(filePath, projectID string, gdb *db.GraphDB) (string, e
 				// Trim to single line for structure review
 				firstLine := strings.Split(docstring, "\n")[0]
 				if len(firstLine) > 60 {
-					firstLine = firstLine[:60] + "..."
+					firstLine = truncateString(firstLine, 60) + "..."
 				}
 				sb.WriteString(fmt.Sprintf("  Docstring: %s\n", firstLine))
 			}
@@ -1731,7 +1731,7 @@ func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB,
 		if details, ok := se.Event["details"].(string); ok && details != "" {
 			// truncate details if too long
 			if len(details) > 300 {
-				details = details[:300] + "..."
+				details = truncateString(details, 300) + "..."
 			}
 			sb.WriteString(fmt.Sprintf("   Details: %s\n", strings.ReplaceAll(details, "\n", "\n   ")))
 		}
@@ -2003,7 +2003,7 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 				if docstring != "" {
 					firstLine := strings.Split(docstring, "\n")[0]
 					if len(firstLine) > 80 {
-						firstLine = firstLine[:80] + "..."
+						firstLine = truncateString(firstLine, 80) + "..."
 					}
 					dsb.WriteString(fmt.Sprintf("  Docstring: %s\n", firstLine))
 				}
@@ -2395,4 +2395,13 @@ func RunSynthesizeMemories(eventIDs []string, summary, synthesis, projectID stri
 		sb.WriteString(fmt.Sprintf("Archived %d deprecated fragmented events.\n", len(eventIDs)))
 	}
 	return sb.String(), nil
+}
+
+// truncateString safely truncates a string to a max length of runes.
+func truncateString(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen])
+	}
+	return s
 }
