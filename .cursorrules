@@ -28,6 +28,12 @@ Before modifying an existing function or method:
 ## 1.5 Session Bootstrap Hook
 - **Rule 3**: At the very beginning of every new session or chat, you MUST automatically call the `m_cpg_kb_bootstrap` tool to load the Hot Context layer and seed your system prompt / initial context with active project tasks and entities.
 
+## 1.6 Proactive Memory Management for Agents & Sub-agents
+To function effectively as a memory-augmented agent, you MUST proactively manage the context window and external memory. Do not wait for the user to remind you:
+- **Rule 4 (Search First)**: When starting a new task, exploring a new bug, or encountering an unfamiliar API, automatically use `m_cpg_search` or `m_cpg_search_memory` to fetch relevant history and code structural context.
+- **Rule 5 (Record Insights)**: Whenever you make a significant technical decision, discover a subtle bug, or learn a new constraint about the project, automatically call `m_cpg_remember` to store this semantic knowledge for future agents.
+- **Rule 6 (Archive Transcripts)**: When completing a complex sub-task or concluding a long diagnostic session, automatically call `m_cpg_ingest_conversation` to persist the conversational context into the cold episodic memory layer.
+
 ## 2. General Development Rules
 1. **Zero CGO Dependencies**: Keep the Go implementation CGO-free. Use pure Go drivers (such as `modernc.org/sqlite` instead of CGO SQLite).
 2. **Robust Error Handling**: Always return errors explicitly instead of panicking or neglecting them. All external API requests must have deterministic fallbacks.
