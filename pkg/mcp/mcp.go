@@ -515,6 +515,70 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 					Required: []string{"source_fqn", "target_fqn"},
 				},
 			},
+			{
+				Name:        "m_cpg_generate_wiki",
+				Description: "Generates visual memory_index.md and memory_log.md in the project workspace (memory-bank) so human and AI agents can visually browse the accumulated knowledge.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"project_path": map[string]string{
+							"type":        "string",
+							"description": "Absolute path to the project directory where the memory-bank is located.",
+						},
+					},
+					Required: []string{"project_path"},
+				},
+			},
+			{
+				Name:        "m_cpg_synthesize_memories",
+				Description: "Acts as a knowledge curator to synthesize multiple fragmented events into a high-density 'Wiki' node, deprecating the old fragments.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"event_ids": map[string]interface{}{
+							"type":        "array",
+							"items":       map[string]string{"type": "string"},
+							"description": "List of old memory event IDs to archive/deprecate.",
+						},
+						"summary": map[string]string{
+							"type":        "string",
+							"description": "Short summary of the synthesized wiki node.",
+						},
+						"synthesis": map[string]string{
+							"type":        "string",
+							"description": "The rich, synthesized markdown content integrating all the knowledge.",
+						},
+					},
+					Required: []string{"event_ids", "summary", "synthesis"},
+				},
+			},
+			{
+				Name:        "m_cpg_lint_memory",
+				Description: "Scans the agent's memory for knowledge rot (e.g. stale events that haven't been accessed in a while). Returns events for the agent to review, update, or deprecate.",
+				InputSchema: struct {
+					Type       string                 `json:"type"`
+					Properties map[string]interface{} `json:"properties"`
+					Required   []string               `json:"required"`
+				}{
+					Type: "object",
+					Properties: map[string]interface{}{
+						"days_stale": map[string]interface{}{
+							"type":        "integer",
+							"description": "Number of days since last access to consider an event stale (default 30).",
+							"default":     30,
+						},
+					},
+					Required: []string{},
+				},
+			},
 		}
 
 		sendSuccessResponse(req.ID, map[string]interface{}{
@@ -892,6 +956,64 @@ func executeTool(name string, args json.RawMessage, gdb *db.GraphDB, vStore *vec
 		if err != nil {
 			return &mcpToolCallResult{
 				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to find path: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_generate_wiki":
+		var params struct {
+			ProjectPath string `json:"project_path"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+		res, err := RunGenerateWiki(params.ProjectPath, cfg.ProjectID, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to generate wiki: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_synthesize_memories":
+		var params struct {
+			EventIDs  []string `json:"event_ids"`
+			Summary   string   `json:"summary"`
+			Synthesis string   `json:"synthesis"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+
+		res, err := RunSynthesizeMemories(params.EventIDs, params.Summary, params.Synthesis, cfg.ProjectID, gdb, cfg)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to synthesize memories: %v", err)}},
+			}, nil
+		}
+		return &mcpToolCallResult{
+			Content: []mcpContent{{Type: "text", Text: res}},
+		}, nil
+
+	case "m_cpg_lint_memory":
+		var params struct {
+			DaysStale *int `json:"days_stale,omitempty"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, err
+		}
+		daysStale := 30
+		if params.DaysStale != nil && *params.DaysStale > 0 {
+			daysStale = *params.DaysStale
+		}
+		res, err := RunLintMemory(daysStale, cfg.ProjectID, gdb)
+		if err != nil {
+			return &mcpToolCallResult{
+				Content: []mcpContent{{Type: "text", Text: fmt.Sprintf("Failed to lint memory: %v", err)}},
 			}, nil
 		}
 		return &mcpToolCallResult{
@@ -1387,6 +1509,45 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	if sb.Len() <= len(fmt.Sprintf("Hybrid Search Results for query: '%s'\n==================================================\n\n", query)) {
 		return fmt.Sprintf("No relevant code or event memory found for query: '%s'", query), nil
 	}
+
+	return sb.String(), nil
+}
+
+// RunLintMemory retrieves events that haven't been accessed for the specified number of days and flags them for AI review.
+func RunLintMemory(daysStale int, projectID string, gdb *db.GraphDB) (string, error) {
+	staleThreshold := time.Now().AddDate(0, 0, -daysStale).Unix()
+
+	events, err := gdb.GetStaleEvents(projectID, staleThreshold)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch stale events: %w", err)
+	}
+
+	if len(events) == 0 {
+		return fmt.Sprintf("Good news! No stale memories found older than %d days.", daysStale), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Memory Lint Report: Found %d stale events not accessed in over %d days.\n", len(events), daysStale))
+	sb.WriteString("========================================================================\n\n")
+
+	for i, ev := range events {
+		id := ev["id"].(string)
+		eventType := ev["event_type"].(string)
+		summary := ev["summary"].(string)
+		details := ev["details"].(string)
+		lastAccessed := time.Unix(ev["last_accessed"].(int64), 0).Format("2006-01-02")
+
+		sb.WriteString(fmt.Sprintf("%d. [ID: %s] Type: %s (Last Accessed: %s)\n", i+1, id, eventType, lastAccessed))
+		sb.WriteString(fmt.Sprintf("   Summary: %s\n", summary))
+		if len(details) > 150 {
+			sb.WriteString(fmt.Sprintf("   Details: %s...\n", strings.ReplaceAll(details[:150], "\n", " ")))
+		} else {
+			sb.WriteString(fmt.Sprintf("   Details: %s\n", strings.ReplaceAll(details, "\n", " ")))
+		}
+		sb.WriteString("------------------------------------------------------------------------\n")
+	}
+
+	sb.WriteString("\nAction Required: Please review these events. If they are outdated (knowledge rot), use `m_cpg_consolidate_memories` or `m_cpg_synthesize_memories` to deprecate/archive them, or manually write a new memory to supersede them.")
 
 	return sb.String(), nil
 }
@@ -2095,4 +2256,143 @@ func RunFindPath(sourceFqn, targetFqn string, gdb *db.GraphDB) (string, error) {
 		}
 	}
 	return fmt.Sprintf("No path found between '%s' and '%s'.", sourceFqn, targetFqn), nil
+}
+
+// RunGenerateWiki generates memory_index.md and memory_log.md in the project's memory-bank directory
+func RunGenerateWiki(projectPath string, projectID string, gdb *db.GraphDB) (string, error) {
+	mbDir := filepath.Join(projectPath, "memory-bank")
+	if err := os.MkdirAll(mbDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create memory-bank directory: %w", err)
+	}
+
+	// 1. Generate memory_index.md (Content-oriented)
+	concepts, err := gdb.GetTopConcepts(50)
+	if err != nil {
+		return "", fmt.Errorf("failed to get top concepts: %w", err)
+	}
+
+	events, err := gdb.GetAllActiveEvents(projectID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get events: %w", err)
+	}
+
+	indexFile := filepath.Join(mbDir, "memory_index.md")
+	var idxSb strings.Builder
+	idxSb.WriteString("# Memory Index\n\nThis is a content-oriented catalog of everything the AI agent has learned, organized by abstract concepts.\n\n")
+
+	idxSb.WriteString("## High-Level Concepts\n\n")
+	for _, c := range concepts {
+		name := c["name"].(string)
+		frequency := c["frequency"].(int)
+		idxSb.WriteString(fmt.Sprintf("- **%s** (Mentions: %d)\n", name, frequency))
+	}
+	idxSb.WriteString("\n## Memory Catalog\n\n")
+
+	// Group events by type for index
+	eventsByType := make(map[string][]map[string]any)
+	for _, ev := range events {
+		eventType := ev["event_type"].(string)
+		eventsByType[eventType] = append(eventsByType[eventType], ev)
+	}
+
+	for eType, evs := range eventsByType {
+		idxSb.WriteString(fmt.Sprintf("### %s\n", strings.Title(eType)))
+		for _, ev := range evs {
+			summary := ev["summary"].(string)
+			timestamp := time.Unix(ev["timestamp"].(int64), 0).Format("2006-01-02")
+			impStr := ""
+			if imp, ok := ev["importance"].(int); ok && imp >= 5 {
+				impStr = " 🔥"
+			} else if imp64, ok := ev["importance"].(int64); ok && imp64 >= 5 {
+				impStr = " 🔥"
+			}
+			idxSb.WriteString(fmt.Sprintf("- [%s] %s%s\n", timestamp, summary, impStr))
+		}
+		idxSb.WriteString("\n")
+	}
+
+	if err := os.WriteFile(indexFile, []byte(idxSb.String()), 0644); err != nil {
+		return "", fmt.Errorf("failed to write memory_index.md: %w", err)
+	}
+
+	// 2. Generate memory_log.md (Chronological)
+	// Sort all events by timestamp descending
+	sort.Slice(events, func(i, j int) bool {
+		return events[i]["timestamp"].(int64) > events[j]["timestamp"].(int64)
+	})
+
+	logFile := filepath.Join(mbDir, "memory_log.md")
+	var logSb strings.Builder
+	logSb.WriteString("# Memory Log\n\nAn append-only chronological record of operations and memories.\n\n")
+
+	for _, ev := range events {
+		timestamp := time.Unix(ev["timestamp"].(int64), 0).Format("2006-01-02 15:04:05")
+		eventType := ev["event_type"].(string)
+		summary := ev["summary"].(string)
+		details := ev["details"].(string)
+
+		logSb.WriteString(fmt.Sprintf("## [%s] %s | %s\n", timestamp, eventType, summary))
+		if details != "" {
+			logSb.WriteString(fmt.Sprintf("%s\n\n", details))
+		}
+	}
+
+	if err := os.WriteFile(logFile, []byte(logSb.String()), 0644); err != nil {
+		return "", fmt.Errorf("failed to write memory_log.md: %w", err)
+	}
+
+	return fmt.Sprintf("Successfully generated memory_index.md and memory_log.md in %s", mbDir), nil
+}
+
+// RunSynthesizeMemories archives old fragmented events and saves a new high-importance synthesis event.
+func RunSynthesizeMemories(eventIDs []string, summary, synthesis, projectID string, gdb *db.GraphDB, cfg *config.Config) (string, error) {
+	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
+		return "", err
+	}
+
+	// Archive old events
+	if len(eventIDs) > 0 {
+		if err := gdb.ArchiveEvents(nil, eventIDs); err != nil {
+			return "", fmt.Errorf("failed to archive old fragmented events: %w", err)
+		}
+	}
+
+	// Create new synthesis event
+	id := uuid.New().String()
+	timestamp := time.Now().Unix()
+	eventType := "synthesis"
+	importance := 8 // High importance for synthesized knowledge
+
+	embedText := fmt.Sprintf("[%s] %s\n%s", eventType, summary, synthesis)
+	emb, err := vector.GetEmbedding(
+		embedText,
+		cfg.Embedding.Provider,
+		cfg.Embedding.Model,
+		cfg.Embedding.Endpoint,
+		cfg.Embedding.APIKey,
+		cfg.Embedding.Dimension,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to embed synthesis: %v. Falling back to pseudo-embedding.\n", err)
+		emb = vector.GeneratePseudoEmbedding(embedText, cfg.Embedding.Dimension)
+	}
+
+	embBytes := vector.Float32SliceToBytes(emb)
+	err = gdb.SaveEvent(nil, id, eventType, summary, synthesis, timestamp, embBytes, "active", importance, projectID)
+	if err != nil {
+		return "", fmt.Errorf("failed to save synthesized memory to DB: %w", err)
+	}
+
+	// Extract and save abstract concepts
+	concepts := concept.ExtractConcepts(summary + " " + synthesis)
+	if err := gdb.SaveConcepts(nil, id, concepts); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to save concepts for synthesis %s: %v\n", id, err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Successfully saved synthesized Wiki memory '%s' (ID: %s).\n", summary, id))
+	if len(eventIDs) > 0 {
+		sb.WriteString(fmt.Sprintf("Archived %d deprecated fragmented events.\n", len(eventIDs)))
+	}
+	return sb.String(), nil
 }
