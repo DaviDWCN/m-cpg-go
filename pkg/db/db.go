@@ -287,10 +287,62 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		}
 	}
 
+	if err := g.ensureNodeFTS(); err != nil {
+		return err
+	}
+
 	if err := g.purgeCallPlaceholders(); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// ensureNodeFTS builds a trigram full-text index over symbol names and
+// docstrings. Triggers keep it aligned with nodes, including INSERT OR REPLACE.
+func (g *GraphDB) ensureNodeFTS() error {
+	if _, err := g.db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+			name, fqn, docstring,
+			content='nodes', content_rowid='rowid',
+			tokenize='trigram'
+		);`); err != nil {
+		return fmt.Errorf("failed to create nodes_fts: %w", err)
+	}
+	triggers := []string{
+		`CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN
+			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
+			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
+			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
+			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring);
+		END;`,
+	}
+	for _, trigger := range triggers {
+		if _, err := g.db.Exec(trigger); err != nil {
+			return fmt.Errorf("failed to create nodes_fts trigger: %w", err)
+		}
+	}
+
+	var nodeCount, ftsCount int
+	if err := g.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodeCount); err != nil {
+		return err
+	}
+	if err := g.db.QueryRow(`SELECT COUNT(*) FROM nodes_fts`).Scan(&ftsCount); err != nil {
+		return err
+	}
+	if nodeCount != ftsCount {
+		if _, err := g.db.Exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("failed to rebuild nodes_fts: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -1745,6 +1797,8 @@ type LexicalHit struct {
 }
 
 // SearchLexical ranks nodes by identifier and docstring overlap with the query.
+// Tokens of 3+ characters go through the FTS5 trigram index. Shorter tokens
+// fall back to LIKE because trigram cannot index them.
 func (g *GraphDB) SearchLexical(projectID, query string, limit int) ([]LexicalHit, error) {
 	tokens := lexicalTokens(query)
 	if len(tokens) == 0 || limit <= 0 {
@@ -1753,6 +1807,52 @@ func (g *GraphDB) SearchLexical(projectID, query string, limit int) ([]LexicalHi
 	if len(tokens) > 8 {
 		tokens = tokens[:8]
 	}
+
+	var ftsTokens []string
+	for _, token := range tokens {
+		if len([]rune(token)) >= 3 {
+			ftsTokens = append(ftsTokens, token)
+		}
+	}
+	if len(ftsTokens) == 0 {
+		return g.searchLexicalLike(projectID, tokens, limit)
+	}
+
+	parts := make([]string, len(ftsTokens))
+	for i, token := range ftsTokens {
+		parts[i] = `"` + strings.ReplaceAll(token, `"`, `""`) + `"`
+	}
+	rows, err := g.db.Query(`
+		SELECT n.id
+		FROM nodes_fts
+		JOIN nodes n ON n.rowid = nodes_fts.rowid
+		WHERE nodes_fts MATCH ? AND (? = '' OR n.project_id = ?)
+		ORDER BY bm25(nodes_fts)
+		LIMIT ?`,
+		strings.Join(parts, " OR "), projectID, projectID, limit,
+	)
+	if err != nil {
+		return g.searchLexicalLike(projectID, tokens, limit)
+	}
+	defer rows.Close()
+
+	var hits []LexicalHit
+	score := limit
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		hits = append(hits, LexicalHit{ID: id, Score: score})
+		score--
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+func (g *GraphDB) searchLexicalLike(projectID string, tokens []string, limit int) ([]LexicalHit, error) {
 
 	var clauses []string
 	args := []any{projectID}
@@ -1815,17 +1915,35 @@ func lexicalTokens(query string) []string {
 	})
 	var tokens []string
 	seen := make(map[string]bool)
-	for _, part := range parts {
-		if len(part) < 2 {
-			continue
+	add := func(part string) {
+		if len([]rune(part)) < 2 {
+			return
 		}
 		key := strings.ToLower(part)
 		if seen[key] {
-			continue
+			return
 		}
 		seen[key] = true
 		tokens = append(tokens, part)
 	}
+	for _, part := range parts {
+		add(part)
+	}
+	var han []rune
+	flushHan := func() {
+		if len(han) >= 2 {
+			add(string(han))
+		}
+		han = han[:0]
+	}
+	for _, r := range query {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			han = append(han, r)
+			continue
+		}
+		flushHan()
+	}
+	flushHan()
 	return tokens
 }
 

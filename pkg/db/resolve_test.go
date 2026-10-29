@@ -45,6 +45,48 @@ func TestResolveProjectCalls(t *testing.T) {
 	}
 }
 
+func TestSearchLexicalUsesFTS(t *testing.T) {
+	gdb, err := InitDB(filepath.Join(t.TempDir(), "fts.db"), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gdb.Close()
+
+	if err := gdb.AddNode(nil, "method_db.InitDB", "Method", "InitDB", "db.InitDB", "", "initializes the SQLite database", "p", "db.go", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.AddNode(nil, "method_helper.UniqueHelper", "Method", "UniqueHelper", "helper.UniqueHelper", "", "代码图调用关系", "p", "h.go", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.AddNode(nil, "method_pkg.ID", "Method", "ID", "pkg.ID", "", "", "p", "id.go", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := gdb.SearchLexical("p", "SQLite", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].ID != "method_db.InitDB" {
+		t.Fatalf("expected InitDB for SQLite, got %+v", hits)
+	}
+
+	hits, err = gdb.SearchLexical("p", "代码图", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].ID != "method_helper.UniqueHelper" {
+		t.Fatalf("expected UniqueHelper for 代码图, got %+v", hits)
+	}
+
+	hits, err = gdb.SearchLexical("p", "ID", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].ID != "method_pkg.ID" {
+		t.Fatalf("expected short-token LIKE fallback, got %+v", hits)
+	}
+}
+
 func TestSnapshotIncomingEdgesSurvivesReindex(t *testing.T) {
 	gdb, err := InitDB(filepath.Join(t.TempDir(), "edges.db"), 4)
 	if err != nil {

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -94,6 +95,40 @@ def top_level_function():
 	// Verify CONTAINS edges
 	if len(relations) < 3 {
 		t.Errorf("expected at least 3 containment relations, got %d", len(relations))
+	}
+}
+
+func TestParsePythonBatch(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not installed")
+	}
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.py"), []byte("def alpha():\n    return 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "b.py"), []byte("def beta():\n    return 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := ParsePythonBatch([]string{
+		filepath.Join(tmpDir, "a.py"),
+		filepath.Join(tmpDir, "b.py"),
+	}, "p", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(batch))
+	}
+	found := map[string]bool{}
+	for _, item := range batch {
+		for _, ent := range item.Entities {
+			if ent.Type == "Method" {
+				found[ent.Name] = true
+			}
+		}
+	}
+	if !found["alpha"] || !found["beta"] {
+		t.Fatalf("batch missed methods: %+v", found)
 	}
 }
 

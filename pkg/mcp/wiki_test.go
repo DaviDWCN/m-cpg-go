@@ -1,12 +1,13 @@
 package mcp_test
 
 import (
-	"m-cpg-go/pkg/config"
-	"m-cpg-go/pkg/db"
-	"m-cpg-go/pkg/mcp"
 	"os"
 	"strings"
 	"testing"
+
+	"m-cpg-go/pkg/config"
+	"m-cpg-go/pkg/db"
+	"m-cpg-go/pkg/mcp"
 )
 
 func TestLLMWikiFeatureE2E(t *testing.T) {
