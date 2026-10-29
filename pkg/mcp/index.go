@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"m-cpg-go/pkg/config"
@@ -17,6 +16,10 @@ import (
 	"m-cpg-go/pkg/parser"
 	"m-cpg-go/pkg/vector"
 )
+
+// embedBatchSize is how many symbol texts share one embeddings request.
+// 16 matches the batch the OpenAI-compatible endpoint is expected to accept.
+const embedBatchSize = 16
 
 func computeFileMD5(filePath string) (string, error) {
 	data, err := os.ReadFile(filePath)
@@ -173,68 +176,38 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		return len(allFiles), 0, 0, err
 	}
 
-	// 2. Parallel embedding calculation using goroutines
-	numWorkers := 8
-	if numWorkers > len(parsedEntities) {
-		numWorkers = len(parsedEntities)
-	}
-
-	type embedTask struct {
-		entityIndex int
-		text        string
-	}
-	type embedResult struct {
-		entityIndex int
-		embedding   []float32
-		source      vector.EmbeddingSource
-		err         error
-	}
-
-	tasksChan := make(chan embedTask, len(parsedEntities))
-	resultsChan := make(chan embedResult, len(parsedEntities))
-
-	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range tasksChan {
-				emb, src, err := vector.GetEmbedding(
-					task.text,
-					cfg.Embedding.Provider,
-					cfg.Embedding.Model,
-					cfg.Embedding.Endpoint,
-					cfg.Embedding.APIKey,
-					cfg.Embedding.Dimension,
-				)
-				resultsChan <- embedResult{
-					entityIndex: task.entityIndex,
-					embedding:   emb,
-					source:      src,
-					err:         err,
-				}
-			}
-		}()
-	}
-
+	// 2. Embed symbols in batches. One request per batch keeps a local model
+	// from opening a connection per symbol, and a down endpoint trips the
+	// circuit breaker once instead of once per symbol. Pseudo vectors stay
+	// out of vec0 so a fallback during indexing cannot poison search.
+	texts := make([]string, len(parsedEntities))
 	for i, ent := range parsedEntities {
-		tasksChan <- embedTask{entityIndex: i, text: entityEmbedText(ent)}
+		texts[i] = entityEmbedText(ent)
 	}
-	close(tasksChan)
-
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
 	embeddings := make([][]float32, len(parsedEntities))
-	for res := range resultsChan {
-		// Pseudo vectors are a different geometry from API vectors. Keep them
-		// out of vec0 so a fallback during indexing cannot poison search.
-		if res.err != nil || res.source != vector.EmbeddingSourceAPI || len(res.embedding) != cfg.Embedding.Dimension {
+	for batchStart := 0; batchStart < len(texts); batchStart += embedBatchSize {
+		batchEnd := batchStart + embedBatchSize
+		if batchEnd > len(texts) {
+			batchEnd = len(texts)
+		}
+		vecs, sources, err := vector.GetEmbeddings(
+			texts[batchStart:batchEnd],
+			cfg.Embedding.Provider,
+			cfg.Embedding.Model,
+			cfg.Embedding.Endpoint,
+			cfg.Embedding.APIKey,
+			cfg.Embedding.Dimension,
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[index] embed batch: %v\n", err)
 			continue
 		}
-		embeddings[res.entityIndex] = res.embedding
+		for i := range vecs {
+			if i >= len(sources) || sources[i] != vector.EmbeddingSourceAPI || len(vecs[i]) != cfg.Embedding.Dimension {
+				continue
+			}
+			embeddings[batchStart+i] = vecs[i]
+		}
 	}
 
 	nodesCount := 0

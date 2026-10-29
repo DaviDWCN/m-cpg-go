@@ -260,10 +260,6 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	if _, err := g.db.Exec(createSchemaMeta); err != nil {
 		return fmt.Errorf("failed to create schema_meta table: %w", err)
 	}
-	if _, err := g.db.Exec(`INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', '2');`); err != nil {
-		return fmt.Errorf("failed to store schema version: %w", err)
-	}
-
 	// Create indexes for efficient retrieval and graph traversal
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);",
@@ -290,6 +286,9 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	if err := g.ensureNodeFTS(); err != nil {
 		return err
 	}
+	if _, err := g.db.Exec(`INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', '3');`); err != nil {
+		return fmt.Errorf("failed to store schema version: %w", err)
+	}
 
 	if err := g.purgeCallPlaceholders(); err != nil {
 		return err
@@ -298,32 +297,48 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	return nil
 }
 
-// ensureNodeFTS builds a trigram full-text index over symbol names and
-// docstrings. Triggers keep it aligned with nodes, including INSERT OR REPLACE.
+// codeIndexLimit caps how much source each symbol contributes to the
+// trigram index. The prefix covers a typical method body. The tail of a
+// very long function stays in nodes.code and is still readable by id.
+const codeIndexLimit = 2000
+
+// ensureNodeFTS builds a trigram full-text index over symbol names,
+// docstrings, and the first codeIndexLimit characters of source. The FTS
+// table stores that prefix itself so method bodies stay searchable after a
+// rebuild. Triggers keep it aligned with nodes, including INSERT OR REPLACE.
+// A legacy name/docstring index is dropped and rebuilt.
 func (g *GraphDB) ensureNodeFTS() error {
+	var createSQL string
+	err := g.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes_fts'`).Scan(&createSQL)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to read nodes_fts schema: %w", err)
+	}
+	if err == nil && (!strings.Contains(createSQL, "code_index") || strings.Contains(createSQL, "content=")) {
+		if err := g.dropNodeFTS(); err != nil {
+			return err
+		}
+	}
+
 	if _, err := g.db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-			name, fqn, docstring,
-			content='nodes', content_rowid='rowid',
+			name, fqn, docstring, code_index,
 			tokenize='trigram'
 		);`); err != nil {
 		return fmt.Errorf("failed to create nodes_fts: %w", err)
 	}
 	triggers := []string{
-		`CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN
-			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
-			VALUES (new.rowid, new.name, new.fqn, new.docstring);
-		END;`,
+		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring, code_index)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring, %s);
+		END;`, ftsCodePrefix("new.code")),
 		`CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN
-			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
-			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+			DELETE FROM nodes_fts WHERE rowid = old.rowid;
 		END;`,
-		`CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
-			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
-			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
-			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
-			VALUES (new.rowid, new.name, new.fqn, new.docstring);
-		END;`,
+		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
+			DELETE FROM nodes_fts WHERE rowid = old.rowid;
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring, code_index)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring, %s);
+		END;`, ftsCodePrefix("new.code")),
 	}
 	for _, trigger := range triggers {
 		if _, err := g.db.Exec(trigger); err != nil {
@@ -339,9 +354,30 @@ func (g *GraphDB) ensureNodeFTS() error {
 		return err
 	}
 	if nodeCount != ftsCount {
-		if _, err := g.db.Exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`); err != nil {
+		if _, err := g.db.Exec(`DELETE FROM nodes_fts`); err != nil {
+			return fmt.Errorf("failed to clear nodes_fts: %w", err)
+		}
+		if _, err := g.db.Exec(fmt.Sprintf(`
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring, code_index)
+			SELECT rowid, name, fqn, docstring, %s FROM nodes`, ftsCodePrefix("code"))); err != nil {
 			return fmt.Errorf("failed to rebuild nodes_fts: %w", err)
 		}
+	}
+	return nil
+}
+
+func ftsCodePrefix(column string) string {
+	return fmt.Sprintf("substr(ifnull(%s, ''), 1, %d)", column, codeIndexLimit)
+}
+
+func (g *GraphDB) dropNodeFTS() error {
+	for _, name := range []string{"nodes_fts_ai", "nodes_fts_ad", "nodes_fts_au"} {
+		if _, err := g.db.Exec("DROP TRIGGER IF EXISTS " + name); err != nil {
+			return fmt.Errorf("failed to drop %s: %w", name, err)
+		}
+	}
+	if _, err := g.db.Exec(`DROP TABLE IF EXISTS nodes_fts`); err != nil {
+		return fmt.Errorf("failed to drop legacy nodes_fts: %w", err)
 	}
 	return nil
 }
@@ -538,15 +574,16 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 	return edges, nil
 }
 
-// GetNeighbors retrieves neighboring nodes (nodes connected to the current node)
+// GetNeighbors lists adjacent nodes for ranking and path search.
+// Source text stays on the node row; callers that need it load the node by id.
 func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 	query := `
-	SELECT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties, e.label
+	SELECT n.id, n.type, n.name, n.fqn, e.label
 	FROM edges e
 	JOIN nodes n ON e.target = n.id
 	WHERE e.source = ? AND n.id != ?
 	UNION
-	SELECT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties, e.label
+	SELECT n.id, n.type, n.name, n.fqn, e.label
 	FROM edges e
 	JOIN nodes n ON e.source = n.id
 	WHERE e.target = ? AND n.id != ?;
@@ -559,25 +596,17 @@ func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 
 	var neighbors []map[string]any
 	for rows.Next() {
-		var id, nodeType, name, fqn, code, docstring, projectID, propsJSON, relation string
-		if err := rows.Scan(&id, &nodeType, &name, &fqn, &code, &docstring, &projectID, &propsJSON, &relation); err != nil {
+		var id, nodeType, name, fqn, relation string
+		if err := rows.Scan(&id, &nodeType, &name, &fqn, &relation); err != nil {
 			return nil, err
-		}
-		var props map[string]any
-		if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
-			props = make(map[string]any)
 		}
 
 		neighbors = append(neighbors, map[string]any{
-			"id":         id,
-			"type":       nodeType,
-			"name":       name,
-			"fqn":        fqn,
-			"code":       code,
-			"docstring":  docstring,
-			"project_id": projectID,
-			"properties": props,
-			"relation":   relation,
+			"id":       id,
+			"type":     nodeType,
+			"name":     name,
+			"fqn":      fqn,
+			"relation": relation,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -1796,9 +1825,10 @@ type LexicalHit struct {
 	Score int
 }
 
-// SearchLexical ranks nodes by identifier and docstring overlap with the query.
+// SearchLexical ranks nodes by identifier, docstring, and source overlap.
 // Tokens of 3+ characters go through the FTS5 trigram index. Shorter tokens
-// fall back to LIKE because trigram cannot index them.
+// fall back to LIKE because trigram cannot index them. Column weights prefer
+// a name hit over the same token appearing in a body.
 func (g *GraphDB) SearchLexical(projectID, query string, limit int) ([]LexicalHit, error) {
 	tokens := lexicalTokens(query)
 	if len(tokens) == 0 || limit <= 0 {
@@ -1827,7 +1857,7 @@ func (g *GraphDB) SearchLexical(projectID, query string, limit int) ([]LexicalHi
 		FROM nodes_fts
 		JOIN nodes n ON n.rowid = nodes_fts.rowid
 		WHERE nodes_fts MATCH ? AND (? = '' OR n.project_id = ?)
-		ORDER BY bm25(nodes_fts)
+		ORDER BY bm25(nodes_fts, 10.0, 8.0, 3.0, 0.5)
 		LIMIT ?`,
 		strings.Join(parts, " OR "), projectID, projectID, limit,
 	)
@@ -1858,11 +1888,11 @@ func (g *GraphDB) searchLexicalLike(projectID string, tokens []string, limit int
 	args := []any{projectID}
 	for _, token := range tokens {
 		like := "%" + token + "%"
-		clauses = append(clauses, "(name LIKE ? OR fqn LIKE ? OR docstring LIKE ?)")
-		args = append(args, like, like, like)
+		clauses = append(clauses, "(name LIKE ? OR fqn LIKE ? OR docstring LIKE ? OR ifnull(code, '') LIKE ?)")
+		args = append(args, like, like, like, like)
 	}
 	sqlQuery := `
-	SELECT id, name, fqn, docstring FROM nodes
+	SELECT id, name, fqn, docstring, ifnull(code, '') FROM nodes
 	WHERE project_id = ? AND (` + strings.Join(clauses, " OR ") + `)
 	LIMIT 200;`
 	rows, err := g.db.Query(sqlQuery, args...)
@@ -1873,13 +1903,14 @@ func (g *GraphDB) searchLexicalLike(projectID string, tokens []string, limit int
 
 	var hits []LexicalHit
 	for rows.Next() {
-		var id, name, fqn, docstring string
-		if err := rows.Scan(&id, &name, &fqn, &docstring); err != nil {
+		var id, name, fqn, docstring, code string
+		if err := rows.Scan(&id, &name, &fqn, &docstring, &code); err != nil {
 			return nil, err
 		}
 		nameLower := strings.ToLower(name)
 		fqnLower := strings.ToLower(fqn)
 		docLower := strings.ToLower(docstring)
+		codeLower := strings.ToLower(code)
 		score := 0
 		for _, token := range tokens {
 			token = strings.ToLower(token)
@@ -1892,6 +1923,9 @@ func (g *GraphDB) searchLexicalLike(projectID string, tokens []string, limit int
 				score += 2
 			}
 			if strings.Contains(docLower, token) {
+				score += 1
+			}
+			if strings.Contains(codeLower, token) {
 				score += 1
 			}
 		}
