@@ -52,7 +52,11 @@ func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRe
 		}
 	}
 
-	return entities, AggregateRelations(relations), err
+	if err != nil {
+		return nil, nil, err
+	}
+	entities, relations = ResolveCallTargets(entities, AggregateRelations(relations))
+	return entities, relations, nil
 }
 
 func parsePythonFileWithAST(code, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {

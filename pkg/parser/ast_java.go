@@ -229,7 +229,8 @@ func ParseJavaFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRela
 		})
 	}
 
-	return entities, AggregateRelations(relations), nil
+	entities, relations = ResolveCallTargets(entities, AggregateRelations(relations))
+	return entities, relations, nil
 }
 
 func isJavaKeyword(word string) bool {

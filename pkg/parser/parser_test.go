@@ -168,6 +168,49 @@ func SimpleHelper() {
 	}
 }
 
+func TestParseGoFileResolvesLocalCalls(t *testing.T) {
+	tmpDir := t.TempDir()
+	goCode := `package main
+
+import "fmt"
+
+func SimpleHelper() {}
+
+func (g *Greeter) Greet(name string) string {
+	SimpleHelper()
+	return fmt.Sprintf("%s", name)
+}
+
+type Greeter struct{}
+`
+	goFile := filepath.Join(tmpDir, "main.go")
+	if err := os.WriteFile(goFile, []byte(goCode), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, relations, err := ParseGoFile(goFile, "test-proj", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawHelper, sawSprintf bool
+	for _, rel := range relations {
+		if rel.Label != "CALLS" || rel.Source != "method_main.Greeter.Greet" {
+			continue
+		}
+		if rel.Target == "method_main.SimpleHelper" {
+			sawHelper = true
+		}
+		if rel.Callee == "fmt.Sprintf" && rel.Target == "" {
+			sawSprintf = true
+		}
+	}
+	if !sawHelper {
+		t.Fatalf("expected Greet to call method_main.SimpleHelper, relations=%v", relations)
+	}
+	if !sawSprintf {
+		t.Fatalf("expected unresolved fmt.Sprintf call, relations=%v", relations)
+	}
+}
+
 func TestParseMarkdownFile(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "m-cpg-parser-test-*")
 	if err != nil {
@@ -289,7 +332,7 @@ async function doSomething() {
 	}
 
 	for _, rel := range relations {
-		if rel.Source == "method_helper.doSomething" && rel.Target == "call_helperFunction" && rel.Label == "CALLS" {
+		if rel.Source == "method_helper.doSomething" && rel.Target == "method_helper.helperFunction" && rel.Label == "CALLS" {
 			foundCalls = true
 		}
 	}
@@ -403,10 +446,10 @@ interface MyInterface {
 		if rel.Source == "class_com.example.service.CustomerService" && rel.Target == "method_com.example.service.CustomerService.createCustomer" && rel.Label == "CONTAINS" {
 			foundContains = true
 		}
-		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "call_println" && rel.Label == "CALLS" {
+		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Label == "CALLS" && rel.Callee == "println" && rel.Target == "" {
 			foundCallsPrintln = true
 		}
-		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "call_helperMethod" && rel.Label == "CALLS" {
+		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "method_com.example.service.CustomerService.helperMethod" && rel.Label == "CALLS" {
 			foundCallsHelper = true
 		}
 	}
@@ -464,7 +507,7 @@ class MyClass {
 	// Verify CALLS relation from myMethod to compute
 	foundComputeCall := false
 	for _, rel := range relations {
-		if rel.Source == "method_com.example.MyClass.myMethod" && rel.Target == "call_compute" && rel.Label == "CALLS" {
+		if rel.Source == "method_com.example.MyClass.myMethod" && rel.Target == "method_com.example.MyClass.compute" && rel.Label == "CALLS" {
 			foundComputeCall = true
 		}
 	}

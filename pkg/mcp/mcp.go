@@ -302,10 +302,10 @@ func handleRequest(req *jsonRPCRequest, gdb *db.GraphDB, vStore *vector.VectorSt
 							"type":        "string",
 							"description": "Type of memory: 'error_fix', 'preference', 'session_log'.",
 						},
-							"importance": map[string]interface{}{
-								"type":        "integer",
-								"description": "Optional importance score (0-10, default 0). High-importance memories will be injected into the Hot Context at session start.",
-							},
+						"importance": map[string]interface{}{
+							"type":        "integer",
+							"description": "Optional importance score (0-10, default 0). High-importance memories will be injected into the Hot Context at session start.",
+						},
 					},
 					Required: []string{"summary", "details", "event_type"},
 				},
@@ -1031,8 +1031,13 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		return 0, 0, 0, err
 	}
 
-	var pyFiles, goFiles, mdFiles, javaFiles []string
-	err := filepath.Walk(projectPath, func(path string, info os.FileInfo, err error) error {
+	projectPath, err := canonicalizePath(projectPath)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	var pyFiles, goFiles, mdFiles, javaFiles, scriptFiles []string
+	err = filepath.Walk(projectPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1051,6 +1056,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			return nil
 		}
 
+		path = canonicalizePathOrSelf(path)
 		ext := strings.ToLower(filepath.Ext(path))
 		switch ext {
 		case ".py":
@@ -1061,6 +1067,8 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			mdFiles = append(mdFiles, path)
 		case ".java":
 			javaFiles = append(javaFiles, path)
+		case ".ts", ".tsx", ".js", ".jsx":
+			scriptFiles = append(scriptFiles, path)
 		}
 		return nil
 	})
@@ -1068,8 +1076,8 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		return 0, 0, 0, err
 	}
 
-	allFiles := append(append(append(pyFiles, goFiles...), mdFiles...), javaFiles...)
-	
+	allFiles := append(append(append(append(pyFiles, goFiles...), mdFiles...), javaFiles...), scriptFiles...)
+
 	// Get stored files
 	storedFiles, err := gdb.GetProjectFiles(projectID)
 	if err != nil {
@@ -1112,17 +1120,17 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 
 	fmt.Fprintf(os.Stderr, "[MCP] Indexing project '%s': %d changed/new files, %d deleted files.\n", projectID, len(changedFiles), len(deletedFiles))
 
-	// Clean up database entries for changed and deleted files
+	// Clean up database entries for changed and deleted files.
+	// Incoming edges from other files are restored after the new nodes exist,
+	// because deleting a node cascades those edges.
+	var savedEdges []db.EdgeRecord
 	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
-		for _, file := range changedFiles {
-			if err := gdb.DeleteNodesByFile(tx, file, projectID); err != nil {
+		for _, file := range append(append([]string{}, changedFiles...), deletedFiles...) {
+			incoming, err := gdb.SnapshotIncomingEdges(tx, file, projectID)
+			if err != nil {
 				return err
 			}
-			if err := gdb.DeleteFileHash(tx, file, projectID); err != nil {
-				return err
-			}
-		}
-		for _, file := range deletedFiles {
+			savedEdges = append(savedEdges, incoming...)
 			if err := gdb.DeleteNodesByFile(tx, file, projectID); err != nil {
 				return err
 			}
@@ -1158,6 +1166,9 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		// Update hashes even if files parsed to empty
 		now := time.Now().Unix()
 		err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+			if err := gdb.RestoreEdges(tx, savedEdges); err != nil {
+				return err
+			}
 			for _, file := range changedFiles {
 				if hash, ok := changedHashes[file]; ok && hash != "" {
 					if err := gdb.SaveFileHash(tx, file, projectID, hash, now); err != nil {
@@ -1183,6 +1194,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	type embedResult struct {
 		entityIndex int
 		embedding   []float32
+		source      vector.EmbeddingSource
 		err         error
 	}
 
@@ -1195,7 +1207,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		go func() {
 			defer wg.Done()
 			for task := range tasksChan {
-				emb, err := vector.GetEmbedding(
+				emb, src, err := vector.GetEmbedding(
 					task.text,
 					cfg.Embedding.Provider,
 					cfg.Embedding.Model,
@@ -1206,6 +1218,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 				resultsChan <- embedResult{
 					entityIndex: task.entityIndex,
 					embedding:   emb,
+					source:      src,
 					err:         err,
 				}
 			}
@@ -1213,21 +1226,7 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 	}
 
 	for i, ent := range parsedEntities {
-		if ent.Type == "Method" {
-			continue // Skip calculating embeddings for methods to prevent database bloat
-		}
-		embedText := ent.Docstring
-		if embedText == "" {
-			if len(ent.Code) > 1000 {
-				embedText = truncateString(ent.Code, 1000)
-			} else {
-				embedText = ent.Code
-			}
-		}
-		if embedText == "" {
-			embedText = ent.Name
-		}
-		tasksChan <- embedTask{entityIndex: i, text: embedText}
+		tasksChan <- embedTask{entityIndex: i, text: entityEmbedText(ent)}
 	}
 	close(tasksChan)
 
@@ -1238,21 +1237,10 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 
 	embeddings := make([][]float32, len(parsedEntities))
 	for res := range resultsChan {
-		if res.err != nil {
-			// On error, generate pseudo-embedding deterministically
-			ent := parsedEntities[res.entityIndex]
-			embedText := ent.Docstring
-			if embedText == "" {
-				if len(ent.Code) > 1000 {
-					embedText = truncateString(ent.Code, 1000)
-				} else {
-					embedText = ent.Code
-				}
-			}
-			if embedText == "" {
-				embedText = ent.Name
-			}
-			res.embedding = vector.GeneratePseudoEmbedding(embedText, cfg.Embedding.Dimension)
+		// Pseudo vectors are a different geometry from API vectors. Keep them
+		// out of vec0 so a fallback during indexing cannot poison search.
+		if res.err != nil || res.source != vector.EmbeddingSourceAPI || len(res.embedding) != cfg.Embedding.Dimension {
+			continue
 		}
 		embeddings[res.entityIndex] = res.embedding
 	}
@@ -1312,21 +1300,33 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 
 		err = gdb.RunInTransaction(func(tx *sql.Tx) error {
 			for _, rel := range batchRelations {
-				var err error
-				if insertedNodeIDs[rel.Source] && insertedNodeIDs[rel.Target] {
-					// Fast path: both nodes exist, execute direct insert
-					propsJSON := "{}"
-					if len(rel.Properties) > 0 {
-						data, _ := json.Marshal(rel.Properties)
-						propsJSON = string(data)
+				if rel.Target == "" {
+					if rel.Callee != "" {
+						if err := gdb.SaveUnresolvedCall(tx, rel.Source, rel.Callee, projectID); err != nil {
+							return err
+						}
 					}
-					query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, ?);`
-					_, err = tx.Exec(query, rel.Source, rel.Target, rel.Label, propsJSON)
-				} else {
-					// Fallback path: one of the nodes might be external
-					err = gdb.AddEdge(tx, rel.Source, rel.Target, rel.Label, rel.Properties)
+					continue
 				}
-				if err != nil {
+				if !insertedNodeIDs[rel.Source] || !insertedNodeIDs[rel.Target] {
+					if rel.Label == "CALLS" {
+						callee := rel.Callee
+						if callee == "" {
+							callee = rel.Target
+						}
+						if err := gdb.SaveUnresolvedCall(tx, rel.Source, callee, projectID); err != nil {
+							return err
+						}
+					}
+					continue
+				}
+				propsJSON := "{}"
+				if len(rel.Properties) > 0 {
+					data, _ := json.Marshal(rel.Properties)
+					propsJSON = string(data)
+				}
+				query := `INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, ?);`
+				if _, err := tx.Exec(query, rel.Source, rel.Target, rel.Label, propsJSON); err != nil {
 					return fmt.Errorf("failed to save edge: %w", err)
 				}
 				edgesCount++
@@ -1338,9 +1338,16 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 		}
 	}
 
-	// 4. Update file hashes
+	// Hashes are written only after edges are restored and unresolved calls are
+	// bound. A failure here leaves the files dirty so the next index retries.
 	now := time.Now().Unix()
-	err = gdb.RunInTransaction(func(tx *sql.Tx) error {
+	if err := gdb.RunInTransaction(func(tx *sql.Tx) error {
+		if err := gdb.RestoreEdges(tx, savedEdges); err != nil {
+			return err
+		}
+		if _, err := gdb.ResolveProjectCalls(tx, projectID); err != nil {
+			return err
+		}
 		for _, file := range changedFiles {
 			if hash, ok := changedHashes[file]; ok && hash != "" {
 				if err := gdb.SaveFileHash(tx, file, projectID, hash, now); err != nil {
@@ -1349,9 +1356,8 @@ func RunIndexing(projectPath, projectID string, gdb *db.GraphDB, vStore *vector.
 			}
 		}
 		return nil
-	})
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to save new file hashes: %w", err)
+	}); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to finalize index: %w", err)
 	}
 
 	return len(allFiles), nodesCount, edgesCount, nil
@@ -1361,8 +1367,8 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
 		return "", err
 	}
-	// 1. Get embedding for the query
-	emb, err := vector.GetEmbedding(
+	// 1. Embed the query once and reuse it for code search and memory search.
+	emb, _, err := vector.GetEmbedding(
 		query,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -1378,24 +1384,63 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	sb.WriteString(fmt.Sprintf("Hybrid Search Results for query: '%s'\n", query))
 	sb.WriteString("==================================================\n\n")
 
-	// 2. Query VectorStore for matching IDs (Code Nodes) using expanded limits for RRF
-	results := vStore.Search(emb, topK*3)
+	// 2. Vector hits. A vec0 failure still leaves the lexical channel usable.
+	vectorLimit := topK * 3
+	if vectorLimit < topK {
+		vectorLimit = topK
+	}
+	results, vecErr := vStore.Search(emb, vectorLimit, cfg.ProjectID)
+	if vecErr != nil {
+		fmt.Fprintf(os.Stderr, "[vector] search: %v\n", vecErr)
+		results = nil
+	}
 
-	// RRF Maps
+	// RRF lists: vector distance, lexical symbol overlap, and one-hop neighbors.
 	vectorRanks := make(map[string]int)
+	lexicalRanks := make(map[string]int)
 	graphScores := make(map[string]float32)
 
+	lexicalHits, lexErr := gdb.SearchLexical(cfg.ProjectID, query, vectorLimit)
+	if lexErr != nil {
+		fmt.Fprintf(os.Stderr, "[search] lexical: %v\n", lexErr)
+	}
+	for i, hit := range lexicalHits {
+		lexicalRanks[hit.ID] = i + 1
+	}
+
+	seedIDs := make([]string, 0, len(results)+len(lexicalHits))
 	for i, res := range results {
 		vectorRanks[res.ID] = i + 1
-		neighbors, _ := gdb.GetNeighbors(res.ID)
+		seedIDs = append(seedIDs, res.ID)
+	}
+	for _, hit := range lexicalHits {
+		if _, ok := vectorRanks[hit.ID]; !ok {
+			seedIDs = append(seedIDs, hit.ID)
+		}
+	}
+	if len(seedIDs) > 20 {
+		seedIDs = seedIDs[:20]
+	}
+	for _, id := range seedIDs {
+		neighbors, _ := gdb.GetNeighbors(id)
+		seedScore := float32(1)
+		for _, res := range results {
+			if res.ID == id {
+				seedScore = res.Score
+				break
+			}
+		}
 		for _, n := range neighbors {
-			nID := n["id"].(string)
+			nID, _ := n["id"].(string)
+			if nID == "" {
+				continue
+			}
 			relation, _ := n["relation"].(string)
 			weight := float32(1.0)
 			if relation == "CALLS" {
-				weight = 2.0 // Weigh CALLS edges more heavily than CONTAINS or others
+				weight = 2.0
 			}
-			graphScores[nID] += res.Score * weight
+			graphScores[nID] += seedScore * weight
 		}
 	}
 
@@ -1423,6 +1468,9 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	for id := range vectorRanks {
 		allNodes[id] = true
 	}
+	for id := range lexicalRanks {
+		allNodes[id] = true
+	}
 	for id := range graphRanks {
 		allNodes[id] = true
 	}
@@ -1430,6 +1478,9 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 	for id := range allNodes {
 		var score float64
 		if rank, ok := vectorRanks[id]; ok {
+			score += 1.0 / (60.0 + float64(rank))
+		}
+		if rank, ok := lexicalRanks[id]; ok {
 			score += 1.0 / (60.0 + float64(rank))
 		}
 		if rank, ok := graphRanks[id]; ok {
@@ -1496,7 +1547,7 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 
 	// 3. Search Memory Events (The kb_search aspect)
 	// We use the topK for memory events as well
-	memResult, _ := RunSearchMemory(query, topK, cfg.ProjectID, gdb, cfg)
+	memResult, _ := runSearchMemoryEmbedded(query, emb, topK, cfg.ProjectID, gdb)
 	if memResult != "No active memories found matching the query." {
 		sb.WriteString("## Episodic / Semantic Memories:\n")
 		// Strip the "Found X memories matching 'query':\n\n" header from RunSearchMemory output
@@ -1582,8 +1633,6 @@ func RunConsolidateMemories(eventIDs []string, insight string, gdb *db.GraphDB) 
 	return sb.String(), nil
 }
 
-
-
 func sendSuccessResponse(id interface{}, result interface{}) {
 	resp := jsonRPCResponse{
 		JSONRPC: "2.0",
@@ -1620,7 +1669,7 @@ func RunGetFileStructure(filePath, projectID string, gdb *db.GraphDB) (string, e
 		fqnPattern = strings.TrimSuffix(fqnPattern, ".__init__")
 	}
 
-	nodes, err := gdb.QueryNodes("", "", projectID)
+	nodes, err := gdb.QueryStructureByFQNPrefix(projectID, fqnPattern)
 	if err != nil {
 		return "", err
 	}
@@ -1631,22 +1680,14 @@ func RunGetFileStructure(filePath, projectID string, gdb *db.GraphDB) (string, e
 
 	foundCount := 0
 	for _, node := range nodes {
-		nodeFQN := node["fqn"].(string)
-		nodeType := node["type"].(string)
-		docstring := node["docstring"].(string)
-
-		// Match exactly or check if it starts with "fqnPattern." (member classes/methods)
-		if nodeFQN == fqnPattern || strings.HasPrefix(nodeFQN, fqnPattern+".") {
-			foundCount++
-			sb.WriteString(fmt.Sprintf("- [%s] %s\n", nodeType, nodeFQN))
-			if docstring != "" {
-				// Trim to single line for structure review
-				firstLine := strings.Split(docstring, "\n")[0]
-				if len(firstLine) > 60 {
-					firstLine = truncateString(firstLine, 60) + "..."
-				}
-				sb.WriteString(fmt.Sprintf("  Docstring: %s\n", firstLine))
+		foundCount++
+		sb.WriteString(fmt.Sprintf("- [%s] %s\n", node.Type, node.FQN))
+		if node.Docstring != "" {
+			firstLine := strings.Split(node.Docstring, "\n")[0]
+			if len(firstLine) > 60 {
+				firstLine = truncateString(firstLine, 60) + "..."
 			}
+			sb.WriteString(fmt.Sprintf("  Docstring: %s\n", firstLine))
 		}
 	}
 
@@ -1657,13 +1698,16 @@ func RunGetFileStructure(filePath, projectID string, gdb *db.GraphDB) (string, e
 	return sb.String(), nil
 }
 
-// RunSearchMemory retrieves active events related to the query using vector similarity
-// RunSearchMemory retrieves active events related to the query using vector similarity
+// memoryScoreThreshold drops near-zero cosine hits so a search does not
+// refresh last_accessed on unrelated memories.
+const memoryScoreThreshold float32 = 0.20
+
+// RunSearchMemory retrieves memories related to the query using vector similarity.
 func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB, cfg *config.Config) (string, error) {
 	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
 		return "", err
 	}
-	emb, err := vector.GetEmbedding(
+	emb, _, err := vector.GetEmbedding(
 		query,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -1674,8 +1718,11 @@ func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB,
 	if err != nil {
 		return "", fmt.Errorf("failed to embed query: %w", err)
 	}
+	return runSearchMemoryEmbedded(query, emb, limit, projectID, gdb)
+}
 
-	events, err := gdb.GetAllActiveEvents(projectID)
+func runSearchMemoryEmbedded(query string, emb []float32, limit int, projectID string, gdb *db.GraphDB) (string, error) {
+	events, err := gdb.GetEventsForSearch(projectID)
 	if err != nil {
 		return "", fmt.Errorf("failed to retrieve active events: %w", err)
 	}
@@ -1696,10 +1743,17 @@ func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB,
 		scoredEvents = append(scoredEvents, ScoredEvent{Event: ev, Score: score})
 	}
 
-	// Sort descending by score
+	// Sort descending by score and drop hits below the threshold.
 	sort.Slice(scoredEvents, func(i, j int) bool {
 		return scoredEvents[i].Score > scoredEvents[j].Score
 	})
+	filtered := scoredEvents[:0]
+	for _, se := range scoredEvents {
+		if se.Score >= memoryScoreThreshold {
+			filtered = append(filtered, se)
+		}
+	}
+	scoredEvents = filtered
 
 	if limit > len(scoredEvents) {
 		limit = len(scoredEvents)
@@ -1751,7 +1805,7 @@ func RunRemember(summary, details, eventType string, importance int, projectID s
 
 	// Embed summary and details combined
 	embedText := fmt.Sprintf("[%s] %s\n%s", eventType, summary, details)
-	emb, err := vector.GetEmbedding(
+	emb, _, err := vector.GetEmbedding(
 		embedText,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -1816,7 +1870,7 @@ func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summ
 
 		// Create vector embedding for the transcript summary
 		embText := summary + "\n" + transcript
-		emb, err := vector.GetEmbedding(embText, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey, cfg.Embedding.Dimension)
+		emb, _, err := vector.GetEmbedding(embText, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey, cfg.Embedding.Dimension)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to generate embedding for conversation: %v. Falling back to pseudo-embedding.\n", err)
 			emb = vector.GeneratePseudoEmbedding(embText, cfg.Embedding.Dimension)
@@ -1964,7 +2018,7 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 	}
 
 	// 2. Get embedding for the proposed code snippet
-	emb, err := vector.GetEmbedding(
+	emb, _, err := vector.GetEmbedding(
 		codeSnippet,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -1977,7 +2031,10 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 	}
 
 	// 3. Query VectorStore for matching IDs (Top-5)
-	results := vStore.Search(emb, 5)
+	results, err := vStore.Search(emb, 5, cfg.ProjectID)
+	if err != nil {
+		return "", fmt.Errorf("failed to search vectors: %w", err)
+	}
 
 	var duplicates []string
 	for _, res := range results {
@@ -2038,38 +2095,30 @@ func RunFindDuplicates(codeSnippet string, threshold float32, gdb *db.GraphDB, v
 
 // RunReadNode retrieves the code and docstring for a specific node given its FQN.
 func RunReadNode(fqn string, gdb *db.GraphDB) (string, error) {
-	// Querying by FQN filter to prevent fetching the whole database
-	nodes, err := gdb.QueryNodes("", fqn, "")
+	node, err := gdb.GetNodeByFQN(fqn, "")
 	if err != nil {
 		return "", err
 	}
-
-	for _, node := range nodes {
-		nodeFQN, ok := node["fqn"].(string)
-		if !ok {
-			continue
-		}
-		if nodeFQN == fqn {
-			nodeType, _ := node["type"].(string)
-			code, _ := node["code"].(string)
-			docstring, _ := node["docstring"].(string)
-
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("Node [%s] %s:\n", nodeType, fqn))
-			sb.WriteString("==================================================\n")
-			if docstring != "" {
-				sb.WriteString(fmt.Sprintf("Docstring:\n%s\n\n", docstring))
-			}
-			if code != "" {
-				sb.WriteString(fmt.Sprintf("Code:\n```\n%s\n```\n", code))
-			} else {
-				sb.WriteString("No code found for this node.\n")
-			}
-			return sb.String(), nil
-		}
+	if node == nil {
+		return fmt.Sprintf("Node with FQN '%s' not found.", fqn), nil
 	}
 
-	return fmt.Sprintf("Node with FQN '%s' not found.", fqn), nil
+	nodeType, _ := node["type"].(string)
+	code, _ := node["code"].(string)
+	docstring, _ := node["docstring"].(string)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Node [%s] %s:\n", nodeType, fqn))
+	sb.WriteString("==================================================\n")
+	if docstring != "" {
+		sb.WriteString(fmt.Sprintf("Docstring:\n%s\n\n", docstring))
+	}
+	if code != "" {
+		sb.WriteString(fmt.Sprintf("Code:\n```\n%s\n```\n", code))
+	} else {
+		sb.WriteString("No code found for this node.\n")
+	}
+	return sb.String(), nil
 }
 
 // RunQueryGraph executes a structural query pattern (e.g. Method(A) -> CALLS -> Method(B)) on the graph database.
@@ -2088,15 +2137,17 @@ func RunQueryGraph(pattern string, maxDepth int, gdb *db.GraphDB) (string, error
 	sb.WriteString("==================================================\n\n")
 
 	for i, res := range results {
-		id, _ := res["id"].(string)
-		nodeType, _ := res["type"].(string)
-		name, _ := res["name"].(string)
-		fqn, _ := res["fqn"].(string)
+		source, _ := res["source"].(map[string]any)
+		edge, _ := res["edge"].(map[string]any)
+		target, _ := res["target"].(map[string]any)
+		srcFQN, _ := source["fqn"].(string)
+		srcType, _ := source["type"].(string)
+		tgtFQN, _ := target["fqn"].(string)
+		tgtType, _ := target["type"].(string)
+		label, _ := edge["label"].(string)
+		depth, _ := res["depth"].(int)
 
-		// The generic QueryPattern usually returns matched nodes, we can display them
-		sb.WriteString(fmt.Sprintf("%d. [%s] %s (FQN: %s)\n", i+1, nodeType, name, fqn))
-		sb.WriteString(fmt.Sprintf("   [Code omitted. Use m_cpg_read_node with fqn '%s' to read full code]\n", fqn))
-		sb.WriteString(fmt.Sprintf("   Node ID: %s\n", id))
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s -[%s]-> [%s] %s (depth %d)\n", i+1, srcType, srcFQN, label, tgtType, tgtFQN, depth))
 		sb.WriteString("--------------------------------------------------\n")
 	}
 
@@ -2105,39 +2156,19 @@ func RunQueryGraph(pattern string, maxDepth int, gdb *db.GraphDB) (string, error
 
 // RunGetNodeDependencies fetches the callers and callees of a specific node given its FQN
 func RunGetNodeDependencies(fqn string, gdb *db.GraphDB) (string, error) {
-	nodes, err := gdb.QueryNodes("", fqn, "")
+	node, err := gdb.GetNodeByFQN(fqn, "")
 	if err != nil {
 		return "", err
 	}
-
-	var targetNodeID string
-	var targetNodeType string
-	for _, node := range nodes {
-		nodeFQN, ok := node["fqn"].(string)
-		if ok && nodeFQN == fqn {
-			targetNodeID = node["id"].(string)
-			targetNodeType = node["type"].(string)
-			break
-		}
-	}
-
-	if targetNodeID == "" {
+	if node == nil {
 		return fmt.Sprintf("Node with FQN '%s' not found.", fqn), nil
 	}
+	targetNodeID, _ := node["id"].(string)
+	targetNodeType, _ := node["type"].(string)
 
-	// Now we fetch callers (nodes that CALL targetNodeID)
-	// and callees (nodes that targetNodeID CALLS)
-	// We can use gdb.QueryPattern but that doesn't explicitly group by direction easily
-	// unless we do two queries.
-
-	callers, err := gdb.QueryPattern(fmt.Sprintf("*(*) -> CALLS -> %s(%s)", targetNodeType, targetNodeID), 1)
+	callers, callees, err := gdb.GetCallEdges(targetNodeID)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch callers: %v", err)
-	}
-
-	callees, err := gdb.QueryPattern(fmt.Sprintf("%s(%s) -> CALLS -> *(*)", targetNodeType, targetNodeID), 1)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch callees: %v", err)
+		return "", fmt.Errorf("failed to fetch call edges: %w", err)
 	}
 
 	var sb strings.Builder
@@ -2149,13 +2180,7 @@ func RunGetNodeDependencies(fqn string, gdb *db.GraphDB) (string, error) {
 		sb.WriteString("  - None found.\n")
 	} else {
 		for _, c := range callers {
-			cNodeType, _ := c["type"].(string)
-			cName, _ := c["name"].(string)
-			cFQN, _ := c["fqn"].(string)
-			if cFQN == fqn {
-				continue // Skip self if QueryPattern returned it
-			}
-			sb.WriteString(fmt.Sprintf("  - [%s] %s (FQN: %s)\n", cNodeType, cName, cFQN))
+			sb.WriteString(fmt.Sprintf("  - [%s] %s (FQN: %s)\n", c.Type, c.Name, c.FQN))
 		}
 	}
 	sb.WriteString("\n")
@@ -2165,13 +2190,7 @@ func RunGetNodeDependencies(fqn string, gdb *db.GraphDB) (string, error) {
 		sb.WriteString("  - None found.\n")
 	} else {
 		for _, c := range callees {
-			cNodeType, _ := c["type"].(string)
-			cName, _ := c["name"].(string)
-			cFQN, _ := c["fqn"].(string)
-			if cFQN == fqn {
-				continue
-			}
-			sb.WriteString(fmt.Sprintf("  - [%s] %s (FQN: %s)\n", cNodeType, cName, cFQN))
+			sb.WriteString(fmt.Sprintf("  - [%s] %s (FQN: %s)\n", c.Type, c.Name, c.FQN))
 		}
 	}
 
@@ -2180,35 +2199,23 @@ func RunGetNodeDependencies(fqn string, gdb *db.GraphDB) (string, error) {
 
 // RunFindPath searches for the shortest path between two nodes in the graph using BFS.
 func RunFindPath(sourceFqn, targetFqn string, gdb *db.GraphDB) (string, error) {
-	sourceNodes, err := gdb.QueryNodes("", sourceFqn, "")
+	sourceNode, err := gdb.GetNodeByFQN(sourceFqn, "")
 	if err != nil {
 		return "", err
 	}
-	var sourceNodeID string
-	for _, node := range sourceNodes {
-		if nodeFQN, ok := node["fqn"].(string); ok && nodeFQN == sourceFqn {
-			sourceNodeID = node["id"].(string)
-			break
-		}
-	}
-	if sourceNodeID == "" {
+	if sourceNode == nil {
 		return fmt.Sprintf("Source node with FQN '%s' not found.", sourceFqn), nil
 	}
+	sourceNodeID, _ := sourceNode["id"].(string)
 
-	targetNodes, err := gdb.QueryNodes("", targetFqn, "")
+	targetNode, err := gdb.GetNodeByFQN(targetFqn, "")
 	if err != nil {
 		return "", err
 	}
-	var targetNodeID string
-	for _, node := range targetNodes {
-		if nodeFQN, ok := node["fqn"].(string); ok && nodeFQN == targetFqn {
-			targetNodeID = node["id"].(string)
-			break
-		}
-	}
-	if targetNodeID == "" {
+	if targetNode == nil {
 		return fmt.Sprintf("Target node with FQN '%s' not found.", targetFqn), nil
 	}
+	targetNodeID, _ := targetNode["id"].(string)
 
 	if sourceNodeID == targetNodeID {
 		return fmt.Sprintf("Source and target nodes are the same ('%s').", sourceFqn), nil
@@ -2364,7 +2371,7 @@ func RunSynthesizeMemories(eventIDs []string, summary, synthesis, projectID stri
 	importance := 8 // High importance for synthesized knowledge
 
 	embedText := fmt.Sprintf("[%s] %s\n%s", eventType, summary, synthesis)
-	emb, err := vector.GetEmbedding(
+	emb, _, err := vector.GetEmbedding(
 		embedText,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -2395,6 +2402,58 @@ func RunSynthesizeMemories(eventIDs []string, summary, synthesis, projectID stri
 		sb.WriteString(fmt.Sprintf("Archived %d deprecated fragmented events.\n", len(eventIDs)))
 	}
 	return sb.String(), nil
+}
+
+func entityEmbedText(ent parser.CodeEntity) string {
+	switch ent.Type {
+	case "Method":
+		body := ent.Code
+		if len([]rune(body)) > 500 {
+			body = truncateString(body, 500)
+		}
+		parts := []string{ent.FQN}
+		if ent.Docstring != "" {
+			parts = append(parts, ent.Docstring)
+		}
+		if body != "" {
+			parts = append(parts, body)
+		}
+		return strings.Join(parts, "\n")
+	case "Module":
+		if ent.Docstring != "" {
+			return truncateString(ent.Docstring+"\n"+ent.Name, 1000)
+		}
+		return ent.Name
+	default:
+		text := ent.Docstring
+		if text == "" {
+			text = ent.Code
+		}
+		if text == "" {
+			return ent.Name
+		}
+		return truncateString(text, 800)
+	}
+}
+
+func canonicalizePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs, nil
+	}
+	return resolved, nil
+}
+
+func canonicalizePathOrSelf(path string) string {
+	resolved, err := canonicalizePath(path)
+	if err != nil {
+		return path
+	}
+	return resolved
 }
 
 // truncateString safely truncates a string to a max length of runes.

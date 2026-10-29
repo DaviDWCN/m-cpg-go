@@ -3,7 +3,6 @@ package vector
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"math"
 	"unsafe"
 )
@@ -30,31 +29,32 @@ func NewVectorStore(db *sql.DB) *VectorStore {
 	}
 }
 
-
-
-// minHeap implements heap.Interface for SearchResult
-type minHeap []SearchResult
-
-func (h minHeap) Len() int           { return len(h) }
-func (h minHeap) Less(i, j int) bool { return h[i].Score < h[j].Score } // Min-heap: smallest score at root
-func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-
-func (h *minHeap) Push(x interface{}) {
-	*h = append(*h, x.(SearchResult))
-}
-
-func (h *minHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
-}
-
-// Search retrieves the top K matching vectors using cosine similarity
-func (s *VectorStore) Search(queryVec []float32, limit int) []SearchResult {
+// Search retrieves the top K matching vectors using sqlite-vec cosine distance.
+// k is clamped to the number of stored rows because sqlite-vec rejects a k
+// larger than the index. projectID limits hits to one project when set.
+// Results are ordered by ascending distance.
+func (s *VectorStore) Search(queryVec []float32, limit int, projectID string) ([]SearchResult, error) {
 	if s.db == nil || len(queryVec) == 0 || limit <= 0 {
-		return nil
+		return nil, nil
+	}
+
+	var n int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM vectors").Scan(&n); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+
+	k := limit
+	if projectID != "" && k*5 > k {
+		k = limit * 5
+	}
+	if k > n {
+		k = n
+	}
+	if k <= 0 {
+		return nil, nil
 	}
 
 	embBytes := Float32SliceToBytes(queryVec)
@@ -62,13 +62,16 @@ func (s *VectorStore) Search(queryVec []float32, limit int) []SearchResult {
 		SELECT m.node_id, vec_distance_cosine(v.embedding, ?1) as dist, m.metadata
 		FROM vectors v
 		JOIN vectors_meta m ON v.rowid = m.rowid
+		JOIN nodes n ON n.id = m.node_id
 		WHERE v.rowid IN (SELECT rowid FROM vectors WHERE embedding MATCH ?1 AND k = ?2)
+		  AND (?3 = '' OR n.project_id = ?3)
+		ORDER BY dist ASC
+		LIMIT ?4
 	`
 
-	rows, err := s.db.Query(query, embBytes, limit)
+	rows, err := s.db.Query(query, embBytes, k, projectID, limit)
 	if err != nil {
-		fmt.Printf("Vector Search Error: %v\n", err)
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -90,13 +93,16 @@ func (s *VectorStore) Search(queryVec []float32, limit int) []SearchResult {
 		}
 
 		results = append(results, SearchResult{
-			ID:       id,
+			ID: id,
 			// Convert distance to similarity (1 - distance) for backward compatibility
 			Score:    1.0 - dist,
 			Metadata: metadata,
 		})
 	}
-	return results
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // CosineSimilarity calculates the cosine similarity score between two float32 slices

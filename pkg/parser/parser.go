@@ -22,6 +22,9 @@ type CodeRelation struct {
 	Target     string
 	Label      string         // "CONTAINS", "CALLS"
 	Properties map[string]any // Used for things like weights
+	// Callee is the unresolved call-site name. Target is empty until a unique
+	// symbol in this file (or a later project pass) can be bound.
+	Callee string
 }
 
 // DeriveFQN extracts the package/module name based on the file path relative to the source directory
@@ -48,20 +51,106 @@ func DeriveFQN(filePath, srcDir string) string {
 // ParseFile parses a file structurally depending on its extension
 func ParseFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelation, error) {
 	ext := strings.ToLower(filepath.Ext(filePath))
+	var (
+		entities  []CodeEntity
+		relations []CodeRelation
+		err       error
+	)
 	switch ext {
 	case ".py":
-		return ParsePythonFile(filePath, projectID, srcDir)
+		entities, relations, err = ParsePythonFile(filePath, projectID, srcDir)
 	case ".go":
-		return ParseGoFile(filePath, projectID, srcDir)
+		entities, relations, err = ParseGoFile(filePath, projectID, srcDir)
 	case ".md":
-		return ParseMarkdownFile(filePath, projectID, srcDir)
+		entities, relations, err = ParseMarkdownFile(filePath, projectID, srcDir)
 	case ".ts", ".tsx", ".js", ".jsx":
-		return ParseTSFile(filePath, projectID, srcDir)
+		entities, relations, err = ParseTSFile(filePath, projectID, srcDir)
 	case ".java":
-		return ParseJavaFile(filePath, projectID, srcDir)
+		entities, relations, err = ParseJavaFile(filePath, projectID, srcDir)
 	default:
 		return nil, nil, fmt.Errorf("unsupported file extension: %s", ext)
 	}
+	if err != nil {
+		return nil, nil, err
+	}
+	entities, relations = ResolveCallTargets(entities, relations)
+	return entities, relations, nil
+}
+
+// ResolveCallTargets binds CALLS edges to a method or class in the same file
+// when the callee name matches exactly one symbol. Unresolved calls keep the
+// callee name and an empty target so the indexer can retry across the project
+// without inventing placeholder nodes.
+func ResolveCallTargets(entities []CodeEntity, relations []CodeRelation) ([]CodeEntity, []CodeRelation) {
+	byName := make(map[string][]string)
+	for _, ent := range entities {
+		if ent.Type != "Method" && ent.Type != "Class" {
+			continue
+		}
+		byName[ent.Name] = append(byName[ent.Name], ent.ID)
+	}
+
+	resolved := make([]CodeRelation, 0, len(relations))
+	for _, rel := range relations {
+		if rel.Label != "CALLS" {
+			resolved = append(resolved, rel)
+			continue
+		}
+		callee := rel.Callee
+		if callee == "" && strings.HasPrefix(rel.Target, "call_") {
+			callee = strings.TrimPrefix(rel.Target, "call_")
+		}
+		if callee == "" && rel.Target != "" && !strings.HasPrefix(rel.Target, "call_") {
+			resolved = append(resolved, rel)
+			continue
+		}
+
+		simple := callee
+		if i := strings.LastIndex(callee, "."); i >= 0 {
+			simple = callee[i+1:]
+		}
+
+		var ids []string
+		if strings.Contains(callee, ".") {
+			for _, ent := range entities {
+				if ent.Type != "Method" && ent.Type != "Class" {
+					continue
+				}
+				if ent.FQN == callee || strings.HasSuffix(ent.FQN, "."+callee) {
+					ids = append(ids, ent.ID)
+				}
+			}
+		}
+		if len(ids) == 0 {
+			ids = byName[simple]
+		}
+		ids = uniqueIDs(ids)
+		if len(ids) == 1 && ids[0] != rel.Source {
+			rel.Target = ids[0]
+			rel.Callee = ""
+		} else {
+			rel.Target = ""
+			rel.Callee = callee
+		}
+		resolved = append(resolved, rel)
+	}
+	return entities, resolved
+}
+
+func uniqueIDs(ids []string) []string {
+	if len(ids) < 2 {
+		return ids
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 // AggregateRelations groups relations by Source, Target, and Label, summing their weights
