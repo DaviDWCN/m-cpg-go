@@ -2,6 +2,7 @@ package concept
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -38,15 +39,19 @@ var stopWords = map[string]bool{
 	"continue": true, "class": true, "struct": true, "interface": true, "type": true,
 }
 
+var (
+	sentenceDelimiters = regexp.MustCompile(`[.,;:?!()\[\]{}"'\n\r\t]+`)
+	wordRegex          = regexp.MustCompile(`[a-zA-Z0-9_]+`)
+	cjkRun             = regexp.MustCompile(`\p{Han}{2,12}`)
+)
+
 // ExtractConcepts takes a text string and returns a map of unique concept phrases
 // found within it, using a simplified RAKE approach.
 func ExtractConcepts(text string) []string {
 	// 1. Split text into sentences/clauses by punctuation
-	sentenceDelimiters := regexp.MustCompile(`[.,;:?!()\[\]{}"'\n\r\t]+`)
 	sentences := sentenceDelimiters.Split(strings.ToLower(text), -1)
 
 	var candidates []string
-	wordRegex := regexp.MustCompile(`[a-zA-Z0-9_]+`)
 
 	for _, sentence := range sentences {
 		words := wordRegex.FindAllString(sentence, -1)
@@ -69,6 +74,21 @@ func ExtractConcepts(text string) []string {
 		// Add trailing phrase if any
 		if len(currentPhrase) > 0 {
 			candidates = append(candidates, strings.Join(currentPhrase, " "))
+		}
+	}
+
+	for _, run := range cjkRun.FindAllString(text, -1) {
+		candidates = append(candidates, run)
+		runes := []rune(run)
+		if len(runes) < 3 {
+			continue
+		}
+		limit := len(runes) - 1
+		if limit > 6 {
+			limit = 6
+		}
+		for i := 0; i < limit; i++ {
+			candidates = append(candidates, string(runes[i:i+2]))
 		}
 	}
 
@@ -103,14 +123,27 @@ func ExtractConcepts(text string) []string {
 	// Deduplicate and filter (only return phrases with a decent score)
 	// We'll return unique phrases sorted by score (highest first), or just a list.
 	// For simplicity, we just return phrases that exist in our map
-	var results []string
+	type scoredPhrase struct {
+		phrase string
+		score  float64
+	}
+	var ranked []scoredPhrase
 	seen := make(map[string]bool)
 	for phrase, score := range phraseScores {
-		// Minimum score threshold (e.g. at least 1.0) and at least some length
-		if score >= 1.0 && len(phrase) > 2 && !seen[phrase] {
-			results = append(results, phrase)
+		if score >= 1.0 && len([]rune(phrase)) > 1 && !seen[phrase] {
+			ranked = append(ranked, scoredPhrase{phrase, score})
 			seen[phrase] = true
 		}
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].score == ranked[j].score {
+			return ranked[i].phrase < ranked[j].phrase
+		}
+		return ranked[i].score > ranked[j].score
+	})
+	results := make([]string, len(ranked))
+	for i, item := range ranked {
+		results[i] = item.phrase
 	}
 
 	return results

@@ -26,7 +26,7 @@ func TestE2ECLI(t *testing.T) {
 	// Clean up after tests
 	defer func() {
 		os.Remove(binaryName)
-		os.Remove("m_cpg.db") // Default database created by app
+		os.Remove("m_cpg.db")         // Default database created by app
 		os.RemoveAll("e2e-test-bank") // Cleanup any generated bank
 	}()
 
@@ -37,6 +37,7 @@ func TestE2ECLI(t *testing.T) {
 
 	t.Run("Index", func(t *testing.T) {
 		cmd := exec.Command(binPath, "index", ".")
+		cmd.Env = append(os.Environ(), "M_CPG_EMBEDDING_PROVIDER=mock")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("Failed to run index command: %v\nOutput: %s", err, string(output))
@@ -47,6 +48,7 @@ func TestE2ECLI(t *testing.T) {
 
 		// Run again to test incremental indexing
 		cmd2 := exec.Command(binPath, "index", ".")
+		cmd2.Env = append(os.Environ(), "M_CPG_EMBEDDING_PROVIDER=mock")
 		output2, err := cmd2.CombinedOutput()
 		if err != nil {
 			t.Fatalf("Failed to run incremental index: %v\nOutput: %s", err, string(output2))
@@ -59,6 +61,7 @@ func TestE2ECLI(t *testing.T) {
 	t.Run("Search", func(t *testing.T) {
 		// Needs to be run after indexing has populated DB
 		cmd := exec.Command(binPath, "search", "SQLite")
+		cmd.Env = append(os.Environ(), "M_CPG_EMBEDDING_PROVIDER=mock")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("Failed to run search command: %v\nOutput: %s", err, string(output))

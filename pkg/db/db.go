@@ -2,14 +2,13 @@ package db
 
 import (
 	"database/sql"
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
 	"encoding/json"
 	"fmt"
+	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
+	_ "github.com/ncruces/go-sqlite3/driver"
 	"os"
 	"path/filepath"
 	"strings"
-
 )
 
 type GraphDB struct {
@@ -84,7 +83,7 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	pragmas := []string{
 		"PRAGMA foreign_keys=ON;",
 		"PRAGMA journal_mode=WAL;",
-		"PRAGMA synchronous=OFF;",
+		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA temp_store=MEMORY;",
 		"PRAGMA cache_size=-20000;",
 		"PRAGMA busy_timeout=5000;",
@@ -116,7 +115,7 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	alterNodesTableFilePath := `ALTER TABLE nodes ADD COLUMN file_path TEXT;`
 	_, alterNodesErr := g.db.Exec(alterNodesTableFilePath)
 	if alterNodesErr != nil && !strings.Contains(alterNodesErr.Error(), "duplicate column name") {
-		fmt.Printf("[DB] Note: Could not alter nodes table file_path column: %v\n", alterNodesErr)
+		fmt.Fprintf(os.Stderr, "[DB] Note: Could not alter nodes table file_path column: %v\n", alterNodesErr)
 	}
 
 	// Create edges table
@@ -175,25 +174,25 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	alterEventsTable := `ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'active';`
 	_, alterErr := g.db.Exec(alterEventsTable)
 	if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column name") {
-		fmt.Printf("[DB] Note: Could not alter events table status column: %v\n", alterErr)
+		fmt.Fprintf(os.Stderr, "[DB] Note: Could not alter events table status column: %v\n", alterErr)
 	}
 
 	alterEventsTableImp := `ALTER TABLE events ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;`
 	_, alterErrImp := g.db.Exec(alterEventsTableImp)
 	if alterErrImp != nil && !strings.Contains(alterErrImp.Error(), "duplicate column name") {
-		fmt.Printf("[DB] Note: Could not alter events table importance column: %v\n", alterErrImp)
+		fmt.Fprintf(os.Stderr, "[DB] Note: Could not alter events table importance column: %v\n", alterErrImp)
 	}
 
 	alterEventsTableAcc := `ALTER TABLE events ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0;`
 	_, alterErrAcc := g.db.Exec(alterEventsTableAcc)
 	if alterErrAcc != nil && !strings.Contains(alterErrAcc.Error(), "duplicate column name") {
-		fmt.Printf("[DB] Note: Could not alter events table last_accessed column: %v\n", alterErrAcc)
+		fmt.Fprintf(os.Stderr, "[DB] Note: Could not alter events table last_accessed column: %v\n", alterErrAcc)
 	}
 
 	alterEventsTableProjectID := `ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT 'global';`
 	_, alterProjErr := g.db.Exec(alterEventsTableProjectID)
 	if alterProjErr != nil && !strings.Contains(alterProjErr.Error(), "duplicate column name") {
-		fmt.Printf("[DB] Note: Could not alter events table project_id column: %v\n", alterProjErr)
+		fmt.Fprintf(os.Stderr, "[DB] Note: Could not alter events table project_id column: %v\n", alterProjErr)
 	}
 
 	// Create file_hashes table for incremental indexing
@@ -241,9 +240,34 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		return fmt.Errorf("failed to create event_concepts table: %w", err)
 	}
 
+	createUnresolved := `
+	CREATE TABLE IF NOT EXISTS unresolved_calls (
+		source TEXT NOT NULL,
+		callee TEXT NOT NULL,
+		project_id TEXT NOT NULL,
+		PRIMARY KEY (source, callee),
+		FOREIGN KEY (source) REFERENCES nodes(id) ON DELETE CASCADE
+	);`
+	if _, err := g.db.Exec(createUnresolved); err != nil {
+		return fmt.Errorf("failed to create unresolved_calls table: %w", err)
+	}
+
+	createSchemaMeta := `
+	CREATE TABLE IF NOT EXISTS schema_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);`
+	if _, err := g.db.Exec(createSchemaMeta); err != nil {
+		return fmt.Errorf("failed to create schema_meta table: %w", err)
+	}
+	if _, err := g.db.Exec(`INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', '2');`); err != nil {
+		return fmt.Errorf("failed to store schema version: %w", err)
+	}
+
 	// Create indexes for efficient retrieval and graph traversal
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_fqn ON nodes(fqn);",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_id);",
 		"CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);",
@@ -254,6 +278,7 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		"CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);",
 		"CREATE INDEX IF NOT EXISTS idx_file_hashes_project ON file_hashes(project_id);",
 		"CREATE INDEX IF NOT EXISTS idx_concepts_freq ON concepts(frequency DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_unresolved_project ON unresolved_calls(project_id);",
 	}
 
 	for _, idxQuery := range indexes {
@@ -262,6 +287,98 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		}
 	}
 
+	if err := g.ensureNodeFTS(); err != nil {
+		return err
+	}
+
+	if err := g.purgeCallPlaceholders(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ensureNodeFTS builds a trigram full-text index over symbol names and
+// docstrings. Triggers keep it aligned with nodes, including INSERT OR REPLACE.
+func (g *GraphDB) ensureNodeFTS() error {
+	if _, err := g.db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+			name, fqn, docstring,
+			content='nodes', content_rowid='rowid',
+			tokenize='trigram'
+		);`); err != nil {
+		return fmt.Errorf("failed to create nodes_fts: %w", err)
+	}
+	triggers := []string{
+		`CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes BEGIN
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN
+			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
+			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
+			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
+			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring);
+		END;`,
+	}
+	for _, trigger := range triggers {
+		if _, err := g.db.Exec(trigger); err != nil {
+			return fmt.Errorf("failed to create nodes_fts trigger: %w", err)
+		}
+	}
+
+	var nodeCount, ftsCount int
+	if err := g.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodeCount); err != nil {
+		return err
+	}
+	if err := g.db.QueryRow(`SELECT COUNT(*) FROM nodes_fts`).Scan(&ftsCount); err != nil {
+		return err
+	}
+	if nodeCount != ftsCount {
+		if _, err := g.db.Exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("failed to rebuild nodes_fts: %w", err)
+		}
+	}
+	return nil
+}
+
+// purgeCallPlaceholders removes legacy call_* stub nodes created before calls
+// were bound to real symbols. Edges cascade; vec0 rows are deleted explicitly.
+func (g *GraphDB) purgeCallPlaceholders() error {
+	rows, err := g.db.Query(`SELECT id FROM nodes WHERE type = 'Node' AND substr(id, 1, 5) = 'call_'`)
+	if err != nil {
+		return fmt.Errorf("failed to list call placeholders: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		var rowid int64
+		err := g.db.QueryRow("SELECT rowid FROM vectors_meta WHERE node_id = ?", id).Scan(&rowid)
+		if err == nil {
+			if _, err := g.db.Exec("DELETE FROM vectors WHERE rowid = ?", rowid); err != nil {
+				return fmt.Errorf("failed to delete placeholder vector: %w", err)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := g.db.Exec(`DELETE FROM nodes WHERE type = 'Node' AND substr(id, 1, 5) = 'call_'`); err != nil {
+		return fmt.Errorf("failed to delete call placeholders: %w", err)
+	}
 	return nil
 }
 
@@ -288,8 +405,8 @@ func (g *GraphDB) AddNode(tx *sql.Tx, id, nodeType, name, fqn, code, docstring, 
 	return nil
 }
 
-// AddEdge inserts or replaces an edge in the graph. Source and Target must exist first to prevent foreign key issues,
-// but to make it simple we insert standard placeholders if they are missing (similar to KuzuAdapter).
+// AddEdge inserts or replaces an edge. Both endpoints must already exist.
+// Missing symbols are recorded as unresolved calls instead of stub nodes.
 func (g *GraphDB) AddEdge(tx *sql.Tx, source, target, label string, props map[string]any) error {
 	propsJSON := "{}"
 	if len(props) > 0 {
@@ -301,16 +418,6 @@ func (g *GraphDB) AddEdge(tx *sql.Tx, source, target, label string, props map[st
 	}
 
 	executor := g.getExecutor(tx)
-
-	// Ensure source node placeholder exists
-	ensureNodeQuery := `INSERT OR IGNORE INTO nodes (id, type, name, fqn, code, docstring, project_id, properties) VALUES (?, 'Node', ?, ?, '', '', '', '{}');`
-	if _, err := executor.Exec(ensureNodeQuery, source, source, source); err != nil {
-		return fmt.Errorf("failed to ensure source node: %w", err)
-	}
-	if _, err := executor.Exec(ensureNodeQuery, target, target, target); err != nil {
-		return fmt.Errorf("failed to ensure target node: %w", err)
-	}
-
 	query := `
 	INSERT OR REPLACE INTO edges (source, target, label, properties)
 	VALUES (?, ?, ?, ?);
@@ -434,12 +541,17 @@ func (g *GraphDB) GetEdges(nodeID string) ([]map[string]any, error) {
 // GetNeighbors retrieves neighboring nodes (nodes connected to the current node)
 func (g *GraphDB) GetNeighbors(nodeID string) ([]map[string]any, error) {
 	query := `
-	SELECT DISTINCT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties, e.label
-	FROM nodes n
-	JOIN edges e ON (e.source = n.id AND e.target = ?) OR (e.target = n.id AND e.source = ?)
-	WHERE n.id != ?;
+	SELECT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties, e.label
+	FROM edges e
+	JOIN nodes n ON e.target = n.id
+	WHERE e.source = ? AND n.id != ?
+	UNION
+	SELECT n.id, n.type, n.name, n.fqn, n.code, n.docstring, n.project_id, n.properties, e.label
+	FROM edges e
+	JOIN nodes n ON e.source = n.id
+	WHERE e.target = ? AND n.id != ?;
 	`
-	rows, err := g.db.Query(query, nodeID, nodeID, nodeID)
+	rows, err := g.db.Query(query, nodeID, nodeID, nodeID, nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query neighbors: %w", err)
 	}
@@ -766,7 +878,7 @@ func (g *GraphDB) RunTieringGC(decayIntervalSeconds int64, currentTime int64) er
 		}
 
 		type eventUpdate struct {
-			id string
+			id            string
 			newImportance int
 		}
 		var toUpdate []eventUpdate
@@ -819,7 +931,7 @@ func (g *GraphDB) RunTieringGC(decayIntervalSeconds int64, currentTime int64) er
 			if _, err := tx.Exec(archiveQuery, args...); err != nil {
 				return fmt.Errorf("failed to batch archive events during GC: %w", err)
 			}
-			fmt.Printf("[DB] Tiering GC archived %d stale events.\n", len(toArchive))
+			fmt.Fprintf(os.Stderr, "[DB] Tiering GC archived %d stale events.\n", len(toArchive))
 		}
 
 		return nil
@@ -1289,7 +1401,7 @@ func (g *GraphDB) DeleteFileHash(tx *sql.Tx, filePath, projectID string) error {
 // DeleteNodesByFile deletes all nodes and their cascaded relations/vectors for a specific file in a project
 func (g *GraphDB) DeleteNodesByFile(tx *sql.Tx, filePath, projectID string) error {
 	executor := g.getExecutor(tx)
-	
+
 	// Get all node IDs in the file to clean up virtual table vectors manually
 	queryIDs := "SELECT id FROM nodes WHERE file_path = ? AND project_id = ?;"
 	rows, err := executor.Query(queryIDs, filePath, projectID)
@@ -1370,4 +1482,522 @@ func (g *GraphDB) SaveConfigMeta(tx *sql.Tx, key, value string) error {
 	executor := g.getExecutor(tx)
 	_, err := executor.Exec(query, key, value)
 	return err
+}
+
+// EdgeRecord is a persisted graph edge captured across a reindex.
+type EdgeRecord struct {
+	Source     string
+	Target     string
+	Label      string
+	Properties string
+}
+
+// SnapshotIncomingEdges returns edges that point at nodes in filePath from
+// nodes stored in other files. Reindexing deletes the file's nodes and would
+// otherwise drop these edges via ON DELETE CASCADE.
+func (g *GraphDB) SnapshotIncomingEdges(tx *sql.Tx, filePath, projectID string) ([]EdgeRecord, error) {
+	executor := g.getExecutor(tx)
+	query := `
+	SELECT e.source, e.target, e.label, e.properties
+	FROM edges e
+	JOIN nodes tgt ON e.target = tgt.id
+	WHERE tgt.file_path = ? AND tgt.project_id = ?
+	  AND e.source NOT IN (
+		SELECT id FROM nodes WHERE file_path = ? AND project_id = ?
+	  );`
+	rows, err := executor.Query(query, filePath, projectID, filePath, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to snapshot incoming edges: %w", err)
+	}
+	defer rows.Close()
+
+	var edges []EdgeRecord
+	for rows.Next() {
+		var edge EdgeRecord
+		if err := rows.Scan(&edge.Source, &edge.Target, &edge.Label, &edge.Properties); err != nil {
+			return nil, err
+		}
+		edges = append(edges, edge)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return edges, nil
+}
+
+// RestoreEdges reinserts edges whose endpoints still exist.
+func (g *GraphDB) RestoreEdges(tx *sql.Tx, edges []EdgeRecord) error {
+	if len(edges) == 0 {
+		return nil
+	}
+	executor := g.getExecutor(tx)
+	for _, edge := range edges {
+		var n int
+		if err := executor.QueryRow(`SELECT COUNT(*) FROM nodes WHERE id IN (?, ?)`, edge.Source, edge.Target).Scan(&n); err != nil {
+			return err
+		}
+		if n != 2 {
+			continue
+		}
+		props := edge.Properties
+		if props == "" {
+			props = "{}"
+		}
+		if _, err := executor.Exec(
+			`INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, ?, ?)`,
+			edge.Source, edge.Target, edge.Label, props,
+		); err != nil {
+			return fmt.Errorf("failed to restore edge: %w", err)
+		}
+	}
+	return nil
+}
+
+// SaveUnresolvedCall records a call that could not be bound to a symbol.
+func (g *GraphDB) SaveUnresolvedCall(tx *sql.Tx, source, callee, projectID string) error {
+	if source == "" || callee == "" {
+		return nil
+	}
+	executor := g.getExecutor(tx)
+	_, err := executor.Exec(
+		`INSERT OR IGNORE INTO unresolved_calls (source, callee, project_id) VALUES (?, ?, ?)`,
+		source, callee, projectID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to save unresolved call: %w", err)
+	}
+	return nil
+}
+
+// crossFileCallDenylist skips names that collide across a codebase and would
+// bind unrelated call sites when they happen to be unique in one project.
+var crossFileCallDenylist = map[string]bool{
+	"error": true, "string": true, "main": true, "init": true,
+	"get": true, "set": true, "run": true, "close": true,
+	"read": true, "write": true, "len": true, "cap": true,
+	"make": true, "append": true, "println": true, "printf": true,
+	"sprintf": true, "fatal": true, "fatalf": true, "log": true,
+	"print": true, "format": true, "errorf": true,
+}
+
+// ResolveProjectCalls binds unresolved calls to a single method or class in
+// the same project. Ambiguous names stay unresolved.
+func (g *GraphDB) ResolveProjectCalls(tx *sql.Tx, projectID string) (int, error) {
+	executor := g.getExecutor(tx)
+	rows, err := executor.Query(
+		`SELECT id, name, fqn FROM nodes WHERE project_id = ? AND type IN ('Method', 'Class')`,
+		projectID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to load symbols: %w", err)
+	}
+	byName := make(map[string][]string)
+	type symbol struct{ id, fqn string }
+	var symbols []symbol
+	for rows.Next() {
+		var id, name, fqn string
+		if err := rows.Scan(&id, &name, &fqn); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		byName[name] = append(byName[name], id)
+		symbols = append(symbols, symbol{id, fqn})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	callRows, err := executor.Query(
+		`SELECT source, callee FROM unresolved_calls WHERE project_id = ?`,
+		projectID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to load unresolved calls: %w", err)
+	}
+	type pending struct{ source, callee string }
+	var pendingCalls []pending
+	for callRows.Next() {
+		var source, callee string
+		if err := callRows.Scan(&source, &callee); err != nil {
+			callRows.Close()
+			return 0, err
+		}
+		pendingCalls = append(pendingCalls, pending{source, callee})
+	}
+	callRows.Close()
+	if err := callRows.Err(); err != nil {
+		return 0, err
+	}
+
+	resolved := 0
+	for _, call := range pendingCalls {
+		simple := call.callee
+		if i := strings.LastIndex(simple, "."); i >= 0 {
+			simple = simple[i+1:]
+		}
+		if crossFileCallDenylist[strings.ToLower(simple)] {
+			continue
+		}
+
+		var ids []string
+		if strings.Contains(call.callee, ".") {
+			for _, sym := range symbols {
+				if sym.fqn == call.callee || strings.HasSuffix(sym.fqn, "."+call.callee) {
+					ids = append(ids, sym.id)
+				}
+			}
+		}
+		if len(ids) == 0 && !strings.Contains(call.callee, ".") {
+			ids = byName[simple]
+		}
+		if len(ids) != 1 || ids[0] == call.source {
+			continue
+		}
+		if _, err := executor.Exec(
+			`INSERT OR REPLACE INTO edges (source, target, label, properties) VALUES (?, ?, 'CALLS', '{}')`,
+			call.source, ids[0],
+		); err != nil {
+			return resolved, fmt.Errorf("failed to bind call: %w", err)
+		}
+		if _, err := executor.Exec(
+			`DELETE FROM unresolved_calls WHERE source = ? AND callee = ?`,
+			call.source, call.callee,
+		); err != nil {
+			return resolved, err
+		}
+		resolved++
+	}
+	return resolved, nil
+}
+
+// GetNodeByFQN loads one node by its exact fully qualified name.
+func (g *GraphDB) GetNodeByFQN(fqn, projectID string) (map[string]any, error) {
+	query := `SELECT id, type, name, fqn, code, docstring, project_id, properties FROM nodes WHERE fqn = ?`
+	args := []any{fqn}
+	if projectID != "" {
+		query += ` AND project_id = ?`
+		args = append(args, projectID)
+	}
+	query += ` LIMIT 1;`
+	row := g.db.QueryRow(query, args...)
+
+	var nodeID, nodeType, name, gotFQN, code, docstring, gotProject, propsJSON string
+	err := row.Scan(&nodeID, &nodeType, &name, &gotFQN, &code, &docstring, &gotProject, &propsJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan node by fqn: %w", err)
+	}
+	var props map[string]any
+	if err := json.Unmarshal([]byte(propsJSON), &props); err != nil {
+		props = make(map[string]any)
+	}
+	return map[string]any{
+		"id":         nodeID,
+		"type":       nodeType,
+		"name":       name,
+		"fqn":        gotFQN,
+		"code":       code,
+		"docstring":  docstring,
+		"project_id": gotProject,
+		"properties": props,
+	}, nil
+}
+
+// CallEdge is one directed CALLS relationship with the other endpoint's summary.
+type CallEdge struct {
+	ID   string
+	Type string
+	Name string
+	FQN  string
+}
+
+// GetCallEdges returns callers and callees connected by CALLS edges.
+func (g *GraphDB) GetCallEdges(nodeID string) (callers []CallEdge, callees []CallEdge, err error) {
+	callers, err = g.queryCallEdge(`
+		SELECT n.id, n.type, n.name, n.fqn
+		FROM edges e
+		JOIN nodes n ON e.source = n.id
+		WHERE e.target = ? AND e.label = 'CALLS'
+	`, nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	callees, err = g.queryCallEdge(`
+		SELECT n.id, n.type, n.name, n.fqn
+		FROM edges e
+		JOIN nodes n ON e.target = n.id
+		WHERE e.source = ? AND e.label = 'CALLS'
+	`, nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return callers, callees, nil
+}
+
+func (g *GraphDB) queryCallEdge(query, nodeID string) ([]CallEdge, error) {
+	rows, err := g.db.Query(query, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query call edges: %w", err)
+	}
+	defer rows.Close()
+	var edges []CallEdge
+	for rows.Next() {
+		var edge CallEdge
+		if err := rows.Scan(&edge.ID, &edge.Type, &edge.Name, &edge.FQN); err != nil {
+			return nil, err
+		}
+		edges = append(edges, edge)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return edges, nil
+}
+
+// StructureNode is a file-structure row without source text.
+type StructureNode struct {
+	Type      string
+	FQN       string
+	Docstring string
+}
+
+// QueryStructureByFQNPrefix lists nodes whose FQN is the file module or a member of it.
+func (g *GraphDB) QueryStructureByFQNPrefix(projectID, fqnPrefix string) ([]StructureNode, error) {
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(fqnPrefix)
+	query := `
+	SELECT type, fqn, docstring FROM nodes
+	WHERE project_id = ? AND (fqn = ? OR fqn LIKE ? ESCAPE '\')
+	ORDER BY fqn;`
+	rows, err := g.db.Query(query, projectID, fqnPrefix, escaped+".%")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query file structure: %w", err)
+	}
+	defer rows.Close()
+	var nodes []StructureNode
+	for rows.Next() {
+		var node StructureNode
+		if err := rows.Scan(&node.Type, &node.FQN, &node.Docstring); err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// LexicalHit is a symbol match ranked by how the query tokens landed.
+type LexicalHit struct {
+	ID    string
+	Score int
+}
+
+// SearchLexical ranks nodes by identifier and docstring overlap with the query.
+// Tokens of 3+ characters go through the FTS5 trigram index. Shorter tokens
+// fall back to LIKE because trigram cannot index them.
+func (g *GraphDB) SearchLexical(projectID, query string, limit int) ([]LexicalHit, error) {
+	tokens := lexicalTokens(query)
+	if len(tokens) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	if len(tokens) > 8 {
+		tokens = tokens[:8]
+	}
+
+	var ftsTokens []string
+	for _, token := range tokens {
+		if len([]rune(token)) >= 3 {
+			ftsTokens = append(ftsTokens, token)
+		}
+	}
+	if len(ftsTokens) == 0 {
+		return g.searchLexicalLike(projectID, tokens, limit)
+	}
+
+	parts := make([]string, len(ftsTokens))
+	for i, token := range ftsTokens {
+		parts[i] = `"` + strings.ReplaceAll(token, `"`, `""`) + `"`
+	}
+	rows, err := g.db.Query(`
+		SELECT n.id
+		FROM nodes_fts
+		JOIN nodes n ON n.rowid = nodes_fts.rowid
+		WHERE nodes_fts MATCH ? AND (? = '' OR n.project_id = ?)
+		ORDER BY bm25(nodes_fts)
+		LIMIT ?`,
+		strings.Join(parts, " OR "), projectID, projectID, limit,
+	)
+	if err != nil {
+		return g.searchLexicalLike(projectID, tokens, limit)
+	}
+	defer rows.Close()
+
+	var hits []LexicalHit
+	score := limit
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		hits = append(hits, LexicalHit{ID: id, Score: score})
+		score--
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+func (g *GraphDB) searchLexicalLike(projectID string, tokens []string, limit int) ([]LexicalHit, error) {
+
+	var clauses []string
+	args := []any{projectID}
+	for _, token := range tokens {
+		like := "%" + token + "%"
+		clauses = append(clauses, "(name LIKE ? OR fqn LIKE ? OR docstring LIKE ?)")
+		args = append(args, like, like, like)
+	}
+	sqlQuery := `
+	SELECT id, name, fqn, docstring FROM nodes
+	WHERE project_id = ? AND (` + strings.Join(clauses, " OR ") + `)
+	LIMIT 200;`
+	rows, err := g.db.Query(sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search nodes lexically: %w", err)
+	}
+	defer rows.Close()
+
+	var hits []LexicalHit
+	for rows.Next() {
+		var id, name, fqn, docstring string
+		if err := rows.Scan(&id, &name, &fqn, &docstring); err != nil {
+			return nil, err
+		}
+		nameLower := strings.ToLower(name)
+		fqnLower := strings.ToLower(fqn)
+		docLower := strings.ToLower(docstring)
+		score := 0
+		for _, token := range tokens {
+			token = strings.ToLower(token)
+			if nameLower == token {
+				score += 5
+			} else if strings.Contains(nameLower, token) {
+				score += 3
+			}
+			if strings.Contains(fqnLower, token) {
+				score += 2
+			}
+			if strings.Contains(docLower, token) {
+				score += 1
+			}
+		}
+		if score > 0 {
+			hits = append(hits, LexicalHit{ID: id, Score: score})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortLexical(hits)
+	if limit < len(hits) {
+		hits = hits[:limit]
+	}
+	return hits, nil
+}
+
+func lexicalTokens(query string) []string {
+	parts := strings.FieldsFunc(query, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_')
+	})
+	var tokens []string
+	seen := make(map[string]bool)
+	add := func(part string) {
+		if len([]rune(part)) < 2 {
+			return
+		}
+		key := strings.ToLower(part)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		tokens = append(tokens, part)
+	}
+	for _, part := range parts {
+		add(part)
+	}
+	var han []rune
+	flushHan := func() {
+		if len(han) >= 2 {
+			add(string(han))
+		}
+		han = han[:0]
+	}
+	for _, r := range query {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			han = append(han, r)
+			continue
+		}
+		flushHan()
+	}
+	flushHan()
+	return tokens
+}
+
+func sortLexical(hits []LexicalHit) {
+	for i := 1; i < len(hits); i++ {
+		j := i
+		for j > 0 && (hits[j-1].Score < hits[j].Score || (hits[j-1].Score == hits[j].Score && hits[j-1].ID > hits[j].ID)) {
+			hits[j-1], hits[j] = hits[j], hits[j-1]
+			j--
+		}
+	}
+}
+
+// GetEventsForSearch returns active memories plus archived conversation events.
+func (g *GraphDB) GetEventsForSearch(projectID string) ([]map[string]any, error) {
+	if projectID == "" {
+		projectID = "global"
+	}
+	query := `
+	SELECT id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed
+	FROM events
+	WHERE (status = 'active' OR event_type = 'conversation')
+	  AND (project_id = ? OR project_id = 'global')
+	ORDER BY importance DESC, timestamp DESC;
+	`
+	rows, err := g.db.Query(query, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get searchable events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []map[string]any
+	for rows.Next() {
+		var id, eventType, summary, details, status string
+		var timestamp, lastAccessed int64
+		var embedding []byte
+		var importance int
+		if err := rows.Scan(&id, &timestamp, &eventType, &summary, &details, &embedding, &status, &importance, &lastAccessed); err != nil {
+			return nil, fmt.Errorf("failed to scan searchable event: %w", err)
+		}
+		events = append(events, map[string]any{
+			"id":            id,
+			"timestamp":     timestamp,
+			"event_type":    eventType,
+			"summary":       summary,
+			"details":       details,
+			"embedding":     embedding,
+			"status":        status,
+			"importance":    importance,
+			"last_accessed": lastAccessed,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
 }

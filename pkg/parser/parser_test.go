@@ -2,6 +2,7 @@ package parser
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,6 +98,40 @@ def top_level_function():
 	}
 }
 
+func TestParsePythonBatch(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not installed")
+	}
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.py"), []byte("def alpha():\n    return 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "b.py"), []byte("def beta():\n    return 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := ParsePythonBatch([]string{
+		filepath.Join(tmpDir, "a.py"),
+		filepath.Join(tmpDir, "b.py"),
+	}, "p", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(batch))
+	}
+	found := map[string]bool{}
+	for _, item := range batch {
+		for _, ent := range item.Entities {
+			if ent.Type == "Method" {
+				found[ent.Name] = true
+			}
+		}
+	}
+	if !found["alpha"] || !found["beta"] {
+		t.Fatalf("batch missed methods: %+v", found)
+	}
+}
+
 func TestParseGoFile(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "m-cpg-parser-test-*")
 	if err != nil {
@@ -165,6 +200,49 @@ func SimpleHelper() {
 	if !foundStruct || !foundMethod || !foundFunc {
 		t.Errorf("failed to extract Go structures: struct=%t, method=%t, func=%t",
 			foundStruct, foundMethod, foundFunc)
+	}
+}
+
+func TestParseGoFileResolvesLocalCalls(t *testing.T) {
+	tmpDir := t.TempDir()
+	goCode := `package main
+
+import "fmt"
+
+func SimpleHelper() {}
+
+func (g *Greeter) Greet(name string) string {
+	SimpleHelper()
+	return fmt.Sprintf("%s", name)
+}
+
+type Greeter struct{}
+`
+	goFile := filepath.Join(tmpDir, "main.go")
+	if err := os.WriteFile(goFile, []byte(goCode), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, relations, err := ParseGoFile(goFile, "test-proj", tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawHelper, sawSprintf bool
+	for _, rel := range relations {
+		if rel.Label != "CALLS" || rel.Source != "method_main.Greeter.Greet" {
+			continue
+		}
+		if rel.Target == "method_main.SimpleHelper" {
+			sawHelper = true
+		}
+		if rel.Callee == "fmt.Sprintf" && rel.Target == "" {
+			sawSprintf = true
+		}
+	}
+	if !sawHelper {
+		t.Fatalf("expected Greet to call method_main.SimpleHelper, relations=%v", relations)
+	}
+	if !sawSprintf {
+		t.Fatalf("expected unresolved fmt.Sprintf call, relations=%v", relations)
 	}
 }
 
@@ -289,7 +367,7 @@ async function doSomething() {
 	}
 
 	for _, rel := range relations {
-		if rel.Source == "method_helper.doSomething" && rel.Target == "call_helperFunction" && rel.Label == "CALLS" {
+		if rel.Source == "method_helper.doSomething" && rel.Target == "method_helper.helperFunction" && rel.Label == "CALLS" {
 			foundCalls = true
 		}
 	}
@@ -403,10 +481,10 @@ interface MyInterface {
 		if rel.Source == "class_com.example.service.CustomerService" && rel.Target == "method_com.example.service.CustomerService.createCustomer" && rel.Label == "CONTAINS" {
 			foundContains = true
 		}
-		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "call_println" && rel.Label == "CALLS" {
+		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Label == "CALLS" && rel.Callee == "println" && rel.Target == "" {
 			foundCallsPrintln = true
 		}
-		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "call_helperMethod" && rel.Label == "CALLS" {
+		if rel.Source == "method_com.example.service.CustomerService.createCustomer" && rel.Target == "method_com.example.service.CustomerService.helperMethod" && rel.Label == "CALLS" {
 			foundCallsHelper = true
 		}
 	}
@@ -464,7 +542,7 @@ class MyClass {
 	// Verify CALLS relation from myMethod to compute
 	foundComputeCall := false
 	for _, rel := range relations {
-		if rel.Source == "method_com.example.MyClass.myMethod" && rel.Target == "call_compute" && rel.Label == "CALLS" {
+		if rel.Source == "method_com.example.MyClass.myMethod" && rel.Target == "method_com.example.MyClass.compute" && rel.Label == "CALLS" {
 			foundComputeCall = true
 		}
 	}

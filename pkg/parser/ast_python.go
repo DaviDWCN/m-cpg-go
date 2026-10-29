@@ -24,11 +24,6 @@ type scope struct {
 	startLine  int
 }
 
-type pythonASTResult struct {
-	Entities  []CodeEntity
-	Relations []CodeRelation
-}
-
 // ParsePythonFile extracts modules, classes, and functions structurally from a Python file
 func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelation, error) {
 	fileContent, err := os.ReadFile(filePath)
@@ -52,11 +47,14 @@ func ParsePythonFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRe
 		}
 	}
 
-	return entities, AggregateRelations(relations), err
+	if err != nil {
+		return nil, nil, err
+	}
+	entities, relations = ResolveCallTargets(entities, AggregateRelations(relations))
+	return entities, relations, nil
 }
 
-func parsePythonFileWithAST(code, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {
-	pythonScript := `
+var pythonASTProgram = `
 import ast
 import json
 import sys
@@ -72,9 +70,8 @@ def parse(code, module_fqn, module_id):
     lines = code.split("\n")
     try:
         tree = ast.parse(code)
-    except SyntaxError as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+    except SyntaxError:
+        raise
 
     entities = []
     relations = []
@@ -175,34 +172,137 @@ def parse(code, module_fqn, module_id):
     return {"Entities": entities, "Relations": relations}
 
 if __name__ == "__main__":
-    code = sys.stdin.read()
-    module_fqn = sys.argv[1]
-    module_id = sys.argv[2]
-    res = parse(code, module_fqn, module_id)
-    print(json.dumps(res))
+    jobs = json.loads(sys.stdin.read() or "[]")
+    out = []
+    for job in jobs:
+        try:
+            res = parse(job["code"], job["module_fqn"], job["module_id"])
+            res["path"] = job.get("path", "")
+            out.append(res)
+        except Exception as e:
+            out.append({"path": job.get("path", ""), "error": str(e)})
+    sys.stdout.write(json.dumps(out))
 `
 
+func parsePythonFileWithAST(code, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {
+	results, err := runPythonAST(pythonASTProgram, []pythonJob{{
+		Path:      "",
+		Code:      code,
+		ModuleFQN: moduleFqn,
+		ModuleID:  moduleID,
+	}})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil, fmt.Errorf("python parser returned no results")
+	}
+	if results[0].Error != "" {
+		return nil, nil, fmt.Errorf("python parser: %s", results[0].Error)
+	}
+	return results[0].Entities, results[0].Relations, nil
+}
+
+type pythonJob struct {
+	Path      string `json:"path"`
+	Code      string `json:"code"`
+	ModuleFQN string `json:"module_fqn"`
+	ModuleID  string `json:"module_id"`
+}
+
+type pythonBatchResult struct {
+	Path      string         `json:"path"`
+	Entities  []CodeEntity   `json:"Entities"`
+	Relations []CodeRelation `json:"Relations"`
+	Error     string         `json:"error"`
+}
+
+// ParsePythonBatch parses every file in one Python process. A file that the
+// AST rejects falls back to the regex parser. If Python itself cannot start,
+// the caller should parse files one by one.
+func ParsePythonBatch(files []string, projectID, srcDir string) (map[string]pythonBatchResult, error) {
+	if len(files) == 0 {
+		return map[string]pythonBatchResult{}, nil
+	}
+	jobs := make([]pythonJob, 0, len(files))
+	for _, filePath := range files {
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, err
+		}
+		moduleFqn := DeriveFQN(filePath, srcDir)
+		jobs = append(jobs, pythonJob{
+			Path:      filePath,
+			Code:      string(content),
+			ModuleFQN: moduleFqn,
+			ModuleID:  "module_" + moduleFqn,
+		})
+	}
+
+	parsed, err := runPythonAST(pythonASTProgram, jobs)
+	if err != nil {
+		return nil, err
+	}
+	byPath := make(map[string]pythonBatchResult, len(parsed))
+	for _, item := range parsed {
+		byPath[item.Path] = item
+	}
+
+	out := make(map[string]pythonBatchResult, len(files))
+	for _, job := range jobs {
+		item, ok := byPath[job.Path]
+		if !ok || item.Error != "" {
+			entities, relations, regexErr := parsePythonFileRegex(job.Path, job.ModuleFQN, job.ModuleID)
+			if regexErr != nil {
+				return nil, fmt.Errorf("parse %s: %w", job.Path, regexErr)
+			}
+			for i := range entities {
+				entities[i].FilePath = job.Path
+			}
+			entities, relations = ResolveCallTargets(entities, AggregateRelations(relations))
+			out[job.Path] = pythonBatchResult{Path: job.Path, Entities: entities, Relations: relations}
+			continue
+		}
+		for i := range item.Entities {
+			item.Entities[i].FilePath = job.Path
+		}
+		item.Entities, item.Relations = ResolveCallTargets(item.Entities, AggregateRelations(item.Relations))
+		out[job.Path] = item
+	}
+	return out, nil
+}
+
+func runPythonAST(pythonScript string, jobs []pythonJob) ([]pythonBatchResult, error) {
+	payload, err := json.Marshal(jobs)
+	if err != nil {
+		return nil, err
+	}
 	pythonBin := "python3"
 	if _, err := exec.LookPath(pythonBin); err != nil {
 		if _, err2 := exec.LookPath("python"); err2 == nil {
 			pythonBin = "python"
+		} else {
+			return nil, fmt.Errorf("python not found")
 		}
 	}
-	cmd := exec.Command(pythonBin, "-c", pythonScript, moduleFqn, moduleID)
-	cmd.Stdin = strings.NewReader(code)
+	cmd := exec.Command(pythonBin, "-c", pythonScript)
+	cmd.Stdin = bytes.NewReader(payload)
 	var out bytes.Buffer
+	var errBuf bytes.Buffer
 	cmd.Stdout = &out
-
+	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
-		return nil, nil, fmt.Errorf("python script failed: %w", err)
+		msg := strings.TrimSpace(errBuf.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("python script failed: %s", msg)
 	}
-
-	var result pythonASTResult
-	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
-		return nil, nil, fmt.Errorf("failed to unmarshal python script output: %w", err)
+	var results []pythonBatchResult
+	if err := json.Unmarshal(out.Bytes(), &results); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal python script output: %w", err)
 	}
-
-	return result.Entities, result.Relations, nil
+	return results, nil
 }
 
 func parsePythonFileRegex(filePath, moduleFqn, moduleID string) ([]CodeEntity, []CodeRelation, error) {

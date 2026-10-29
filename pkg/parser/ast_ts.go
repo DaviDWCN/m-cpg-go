@@ -9,10 +9,10 @@ import (
 
 var (
 	// Very simple regexes for TS/JS structural parsing
-	tsClassRegex = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z0-9_]+)`)
-	tsFuncRegex  = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)`)
+	tsClassRegex     = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z0-9_]+)`)
+	tsFuncRegex      = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)`)
 	tsArrowFuncRegex = regexp.MustCompile(`^\s*(?:export\s+)?const\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>`)
-	tsMethodRegex = regexp.MustCompile(`^\s*(?:public\s+|private\s+|protected\s+)?(?:async\s+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?::\s*[^{]+)?\{`)
+	tsMethodRegex    = regexp.MustCompile(`^\s*(?:public\s+|private\s+|protected\s+)?(?:async\s+)?([a-zA-Z0-9_]+)\s*\([^)]*\)\s*(?::\s*[^{]+)?\{`)
 )
 
 type tsScope struct {
@@ -171,7 +171,8 @@ func ParseTSFile(filePath, projectID, srcDir string) ([]CodeEntity, []CodeRelati
 		entities[i].FilePath = filePath
 	}
 
-	return entities, AggregateRelations(relations), nil
+	entities, relations = ResolveCallTargets(entities, AggregateRelations(relations))
+	return entities, relations, nil
 }
 
 func findFunctionMatch(line string) []string {
