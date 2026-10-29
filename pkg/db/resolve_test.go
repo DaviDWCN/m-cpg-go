@@ -85,6 +85,139 @@ func TestSearchLexicalUsesFTS(t *testing.T) {
 	if len(hits) == 0 || hits[0].ID != "method_pkg.ID" {
 		t.Fatalf("expected short-token LIKE fallback, got %+v", hits)
 	}
+
+	if err := gdb.AddNode(nil, "method_pkg.Wrap", "Method", "Wrap", "pkg.Wrap", "return Qx", "", "p", "w.go", nil); err != nil {
+		t.Fatal(err)
+	}
+	hits, err = gdb.SearchLexical("p", "Qx", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].ID != "method_pkg.Wrap" {
+		t.Fatalf("expected short token inside code, got %+v", hits)
+	}
+}
+
+func TestSearchLexicalMatchesCodeBody(t *testing.T) {
+	gdb, err := InitDB(filepath.Join(t.TempDir(), "fts.db"), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gdb.Close()
+
+	if err := gdb.AddNode(nil, "method_pkg.Flush", "Method", "Flush", "pkg.Flush", "return db.checkpointwal()", "", "p", "f.go", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.AddNode(nil, "method_pkg.Note", "Method", "Note", "pkg.Note", "", "mentions checkpointwal in the docstring", "p", "n.go", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := gdb.SearchLexical("p", "checkpointwal", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) < 2 {
+		t.Fatalf("expected code and docstring hits, got %+v", hits)
+	}
+	if hits[0].ID != "method_pkg.Note" {
+		t.Fatalf("expected docstring hit to rank first, got %+v", hits)
+	}
+	foundCode := false
+	for _, hit := range hits {
+		if hit.ID == "method_pkg.Flush" {
+			foundCode = true
+		}
+	}
+	if !foundCode {
+		t.Fatalf("expected code-only hit, got %+v", hits)
+	}
+
+	if err := gdb.AddNode(nil, "method_pkg.Flush", "Method", "Flush", "pkg.Flush", "return db.otherTokenzz()", "", "p", "f.go", nil); err != nil {
+		t.Fatal(err)
+	}
+	hits, err = gdb.SearchLexical("p", "checkpointwal", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hit := range hits {
+		if hit.ID == "method_pkg.Flush" {
+			t.Fatalf("replaced source should leave the index, got %+v", hits)
+		}
+	}
+	hits, err = gdb.SearchLexical("p", "otherTokenzz", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].ID != "method_pkg.Flush" {
+		t.Fatalf("expected replaced source to be searchable, got %+v", hits)
+	}
+}
+
+func TestFTSMigratesLegacyIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fts.db")
+	gdb, err := InitDB(path, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installLegacyNodeFTS(t, gdb)
+	if err := gdb.AddNode(nil, "method_pkg.Flush", "Method", "Flush", "pkg.Flush", "return db.checkpointwal()", "", "p", "f.go", nil); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := gdb.SearchLexical("p", "checkpointwal", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("legacy index should not match source text, got %+v", hits)
+	}
+	gdb.Close()
+
+	gdb, err = InitDB(path, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gdb.Close()
+	hits, err = gdb.SearchLexical("p", "checkpointwal", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 || hits[0].ID != "method_pkg.Flush" {
+		t.Fatalf("rebuilt index should match source text, got %+v", hits)
+	}
+}
+
+func installLegacyNodeFTS(t *testing.T, gdb *GraphDB) {
+	t.Helper()
+	statements := []string{
+		`DROP TRIGGER IF EXISTS nodes_fts_ai`,
+		`DROP TRIGGER IF EXISTS nodes_fts_ad`,
+		`DROP TRIGGER IF EXISTS nodes_fts_au`,
+		`DROP TABLE IF EXISTS nodes_fts`,
+		`CREATE VIRTUAL TABLE nodes_fts USING fts5(
+			name, fqn, docstring,
+			content='nodes', content_rowid='rowid',
+			tokenize='trigram'
+		)`,
+		`CREATE TRIGGER nodes_fts_ai AFTER INSERT ON nodes BEGIN
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring);
+		END`,
+		`CREATE TRIGGER nodes_fts_ad AFTER DELETE ON nodes BEGIN
+			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
+			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+		END`,
+		`CREATE TRIGGER nodes_fts_au AFTER UPDATE ON nodes BEGIN
+			INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, docstring)
+			VALUES ('delete', old.rowid, old.name, old.fqn, old.docstring);
+			INSERT INTO nodes_fts(rowid, name, fqn, docstring)
+			VALUES (new.rowid, new.name, new.fqn, new.docstring);
+		END`,
+	}
+	for _, statement := range statements {
+		if _, err := gdb.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestSnapshotIncomingEdgesSurvivesReindex(t *testing.T) {

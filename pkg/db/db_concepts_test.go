@@ -1,8 +1,8 @@
 package db
 
 import (
-	_ "github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/asg017/sqlite-vec-go-bindings/ncruces"
+	_ "github.com/ncruces/go-sqlite3/driver"
 	"os"
 	"testing"
 )
@@ -18,7 +18,7 @@ func TestConceptOperations(t *testing.T) {
 	defer g.Close()
 
 	// Add event
-	err = g.SaveEvent(nil, "evt1", "test", "summary1", "details1", 12345, []byte{0, 1}, "active", 0, "test-project")
+	err = g.SaveEvent(nil, "evt1", "test", "summary1", "details1", 12345, []byte{0, 1}, "active", 0, "test-project", "")
 	if err != nil {
 		t.Fatalf("Failed to save event: %v", err)
 	}
