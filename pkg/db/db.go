@@ -12,7 +12,8 @@ import (
 )
 
 type GraphDB struct {
-	db *sql.DB
+	db        *sql.DB
+	vectorDim int
 }
 
 func (g *GraphDB) GetDB() *sql.DB {
@@ -79,6 +80,7 @@ func InitDB(dbPath string, vectorDim int) (*GraphDB, error) {
 }
 
 func (g *GraphDB) ensureSchema(vectorDim int) error {
+	g.vectorDim = vectorDim
 	// Enable WAL mode and other optimizations for concurrency and performance
 	pragmas := []string{
 		"PRAGMA foreign_keys=ON;",
@@ -195,6 +197,22 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 		fmt.Fprintf(os.Stderr, "[DB] Note: Could not alter events table project_id column: %v\n", alterProjErr)
 	}
 
+	// Event vectors live apart from code vectors. Only API embeddings are
+	// inserted. Pseudo vectors stay on events.embedding and are scored aside
+	// so the two geometries never share one index.
+	createEventVectors := fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS event_vectors USING vec0(embedding float[%d]);`, vectorDim)
+	if _, err := g.db.Exec(createEventVectors); err != nil {
+		return fmt.Errorf("failed to create event_vectors table: %w", err)
+	}
+	createEventVectorsMeta := `CREATE TABLE IF NOT EXISTS event_vectors_meta (
+		rowid INTEGER PRIMARY KEY,
+		event_id TEXT UNIQUE NOT NULL,
+		FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+	);`
+	if _, err := g.db.Exec(createEventVectorsMeta); err != nil {
+		return fmt.Errorf("failed to create event_vectors_meta table: %w", err)
+	}
+
 	// Create file_hashes table for incremental indexing
 	createFileHashesTable := `
 	CREATE TABLE IF NOT EXISTS file_hashes (
@@ -286,7 +304,7 @@ func (g *GraphDB) ensureSchema(vectorDim int) error {
 	if err := g.ensureNodeFTS(); err != nil {
 		return err
 	}
-	if _, err := g.db.Exec(`INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', '3');`); err != nil {
+	if _, err := g.db.Exec(`INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', '4');`); err != nil {
 		return fmt.Errorf("failed to store schema version: %w", err)
 	}
 
@@ -848,21 +866,209 @@ func (g *GraphDB) LoadVectors() ([]VectorRecord, error) {
 	return list, nil
 }
 
-// SaveEvent inserts a new event (preference, error fix, session log) in the database
-func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int, projectID string) error {
+// SaveEvent inserts a new event (preference, error fix, session log) in the database.
+// embedSource "api" writes a matching-dimension vector into event_vectors.
+// Any other source leaves the blob on the row for the residual cosine scan.
+// A nil transaction is wrapped so deleting the previous vector and inserting
+// the new row commit together.
+func (g *GraphDB) SaveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int, projectID, embedSource string) error {
+	if tx != nil {
+		return g.saveEvent(tx, id, eventType, summary, details, timestamp, embedding, status, importance, projectID, embedSource)
+	}
+	return g.RunInTransaction(func(tx *sql.Tx) error {
+		return g.saveEvent(tx, id, eventType, summary, details, timestamp, embedding, status, importance, projectID, embedSource)
+	})
+}
+
+func (g *GraphDB) saveEvent(tx *sql.Tx, id, eventType, summary, details string, timestamp int64, embedding []byte, status string, importance int, projectID, embedSource string) error {
 	if projectID == "" {
 		projectID = "global"
+	}
+	executor := g.getExecutor(tx)
+	if err := g.deleteEventVector(executor, id); err != nil {
+		return err
 	}
 	query := `
 	INSERT OR REPLACE INTO events (id, timestamp, event_type, summary, details, embedding, status, importance, last_accessed, project_id)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
-	executor := g.getExecutor(tx)
-	_, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance, timestamp, projectID)
-	if err != nil {
+	if _, err := executor.Exec(query, id, timestamp, eventType, summary, details, embedding, status, importance, timestamp, projectID); err != nil {
 		return fmt.Errorf("failed to save event: %w", err)
 	}
+	if embedSource == "api" && g.vectorDim > 0 && len(embedding) == g.vectorDim*4 {
+		return g.insertEventVector(executor, id, embedding)
+	}
 	return nil
+}
+
+func (g *GraphDB) deleteEventVector(executor sqlExecutor, eventID string) error {
+	var rowid int64
+	err := executor.QueryRow(`SELECT rowid FROM event_vectors_meta WHERE event_id = ?`, eventID).Scan(&rowid)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read event vector: %w", err)
+	}
+	if _, err := executor.Exec(`DELETE FROM event_vectors WHERE rowid = ?`, rowid); err != nil {
+		return fmt.Errorf("failed to delete event vector: %w", err)
+	}
+	if _, err := executor.Exec(`DELETE FROM event_vectors_meta WHERE event_id = ?`, eventID); err != nil {
+		return fmt.Errorf("failed to delete event vector meta: %w", err)
+	}
+	return nil
+}
+
+func (g *GraphDB) insertEventVector(executor sqlExecutor, eventID string, embedding []byte) error {
+	var rowid int64
+	err := executor.QueryRow(`INSERT INTO event_vectors_meta (event_id) VALUES (?) RETURNING rowid`, eventID).Scan(&rowid)
+	if err != nil {
+		return fmt.Errorf("failed to save event vector meta: %w", err)
+	}
+	if _, err := executor.Exec(`INSERT INTO event_vectors (rowid, embedding) VALUES (?, ?)`, rowid, embedding); err != nil {
+		return fmt.Errorf("failed to save event vector: %w", err)
+	}
+	return nil
+}
+
+// EventVectorHit is one indexed memory, nearest first. Distance is cosine distance.
+type EventVectorHit struct {
+	ID       string
+	Distance float32
+}
+
+// SearchEventVectors returns the nearest indexed memories for one project,
+// including global events. k is clamped to the index size. Archived rows are
+// included only when they are conversations, matching the memory search filter.
+func (g *GraphDB) SearchEventVectors(projectID string, query []byte, limit int) ([]EventVectorHit, error) {
+	if projectID == "" {
+		projectID = "global"
+	}
+	if len(query) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	var n int
+	if err := g.db.QueryRow(`SELECT COUNT(*) FROM event_vectors`).Scan(&n); err != nil {
+		return nil, fmt.Errorf("failed to count event vectors: %w", err)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	fetch := limit * 5
+	if fetch < limit {
+		fetch = limit
+	}
+	k := fetch
+	if k > n {
+		k = n
+	}
+	rows, err := g.db.Query(`
+		SELECT m.event_id, vec_distance_cosine(v.embedding, ?1) AS dist
+		FROM event_vectors v
+		JOIN event_vectors_meta m ON v.rowid = m.rowid
+		JOIN events e ON e.id = m.event_id
+		WHERE v.rowid IN (SELECT rowid FROM event_vectors WHERE embedding MATCH ?1 AND k = ?2)
+		  AND (e.status = 'active' OR e.event_type = 'conversation')
+		  AND (e.project_id = ?3 OR e.project_id = 'global')
+		ORDER BY dist ASC
+		LIMIT ?4`,
+		query, k, projectID, fetch,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search event vectors: %w", err)
+	}
+	defer rows.Close()
+	var hits []EventVectorHit
+	for rows.Next() {
+		var hit EventVectorHit
+		if err := rows.Scan(&hit.ID, &hit.Distance); err != nil {
+			return nil, err
+		}
+		hits = append(hits, hit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+// EventEmbedding is a memory that is not in the vector index.
+type EventEmbedding struct {
+	ID        string
+	Embedding []byte
+}
+
+// ListUnindexedEventEmbeddings returns searchable memories whose vectors were
+// not written to event_vectors. Callers score these with cosine directly.
+func (g *GraphDB) ListUnindexedEventEmbeddings(projectID string) ([]EventEmbedding, error) {
+	if projectID == "" {
+		projectID = "global"
+	}
+	rows, err := g.db.Query(`
+		SELECT e.id, e.embedding
+		FROM events e
+		WHERE (e.status = 'active' OR e.event_type = 'conversation')
+		  AND (e.project_id = ? OR e.project_id = 'global')
+		  AND NOT EXISTS (SELECT 1 FROM event_vectors_meta m WHERE m.event_id = e.id)`,
+		projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list unindexed events: %w", err)
+	}
+	defer rows.Close()
+	var events []EventEmbedding
+	for rows.Next() {
+		var ev EventEmbedding
+		if err := rows.Scan(&ev.ID, &ev.Embedding); err != nil {
+			return nil, err
+		}
+		events = append(events, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// EventText is the display row for a memory hit.
+type EventText struct {
+	ID        string
+	EventType string
+	Summary   string
+	Details   string
+}
+
+// GetEventTexts loads display fields for the memories that survived ranking.
+func (g *GraphDB) GetEventTexts(ids []string) (map[string]EventText, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := g.db.Query(
+		`SELECT id, event_type, summary, ifnull(details, '') FROM events WHERE id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load event text: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]EventText, len(ids))
+	for rows.Next() {
+		var ev EventText
+		if err := rows.Scan(&ev.ID, &ev.EventType, &ev.Summary, &ev.Details); err != nil {
+			return nil, err
+		}
+		out[ev.ID] = ev
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // UpdateEventAccess updates the last_accessed timestamp for given event IDs

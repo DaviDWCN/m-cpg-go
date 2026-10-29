@@ -18,7 +18,7 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 		return "", err
 	}
 	// 1. Embed the query once and reuse it for code search and memory search.
-	emb, _, err := vector.GetEmbedding(
+	emb, src, err := vector.GetEmbedding(
 		query,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -197,7 +197,7 @@ func RunSearch(query string, topK int, gdb *db.GraphDB, vStore *vector.VectorSto
 
 	// 3. Search Memory Events (The kb_search aspect)
 	// We use the topK for memory events as well
-	memResult, _ := runSearchMemoryEmbedded(query, emb, topK, cfg.ProjectID, gdb)
+	memResult, _ := runSearchMemoryEmbedded(query, emb, src, topK, cfg.ProjectID, gdb)
 	if memResult != "No active memories found matching the query." {
 		sb.WriteString("## Episodic / Semantic Memories:\n")
 		// Strip the "Found X memories matching 'query':\n\n" header from RunSearchMemory output

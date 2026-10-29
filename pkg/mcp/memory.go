@@ -95,7 +95,7 @@ func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB,
 	if err := VerifyEmbeddingConfig(gdb, cfg); err != nil {
 		return "", err
 	}
-	emb, _, err := vector.GetEmbedding(
+	emb, src, err := vector.GetEmbedding(
 		query,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -106,72 +106,106 @@ func RunSearchMemory(query string, limit int, projectID string, gdb *db.GraphDB,
 	if err != nil {
 		return "", fmt.Errorf("failed to embed query: %w", err)
 	}
-	return runSearchMemoryEmbedded(query, emb, limit, projectID, gdb)
+	return runSearchMemoryEmbedded(query, emb, src, limit, projectID, gdb)
 }
 
-func runSearchMemoryEmbedded(query string, emb []float32, limit int, projectID string, gdb *db.GraphDB) (string, error) {
+type scoredMemory struct {
+	id    string
+	score float32
+}
+
+func runSearchMemoryEmbedded(query string, emb []float32, src vector.EmbeddingSource, limit int, projectID string, gdb *db.GraphDB) (string, error) {
+	if limit <= 0 {
+		return "No active memories found matching the query.", nil
+	}
+	scores := make(map[string]float32)
+	if src == vector.EmbeddingSourceAPI {
+		hits, err := gdb.SearchEventVectors(projectID, vector.Float32SliceToBytes(emb), limit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[memory] vector search: %v\n", err)
+			return searchMemoryScan(query, emb, limit, projectID, gdb)
+		}
+		for _, hit := range hits {
+			scores[hit.ID] = 1 - hit.Distance
+		}
+	}
+	unindexed, err := gdb.ListUnindexedEventEmbeddings(projectID)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve active events: %w", err)
+	}
+	for _, ev := range unindexed {
+		evEmb := vector.BytesToFloat32Slice(ev.Embedding)
+		score := vector.CosineSimilarity(emb, evEmb)
+		if prev, ok := scores[ev.ID]; !ok || score > prev {
+			scores[ev.ID] = score
+		}
+	}
+	return formatScoredMemories(query, scores, limit, gdb)
+}
+
+// searchMemoryScan scores every stored blob. It is the fallback when the
+// event vector index cannot be queried.
+func searchMemoryScan(query string, emb []float32, limit int, projectID string, gdb *db.GraphDB) (string, error) {
 	events, err := gdb.GetEventsForSearch(projectID)
 	if err != nil {
 		return "", fmt.Errorf("failed to retrieve active events: %w", err)
 	}
-
-	type ScoredEvent struct {
-		Event map[string]any
-		Score float32
-	}
-	var scoredEvents []ScoredEvent
-
+	scores := make(map[string]float32)
 	for _, ev := range events {
 		embBytes, ok := ev["embedding"].([]byte)
 		if !ok {
 			continue
 		}
-		evEmb := vector.BytesToFloat32Slice(embBytes)
-		score := vector.CosineSimilarity(emb, evEmb)
-		scoredEvents = append(scoredEvents, ScoredEvent{Event: ev, Score: score})
+		id, _ := ev["id"].(string)
+		if id == "" {
+			continue
+		}
+		scores[id] = vector.CosineSimilarity(emb, vector.BytesToFloat32Slice(embBytes))
 	}
+	return formatScoredMemories(query, scores, limit, gdb)
+}
 
-	// Sort descending by score and drop hits below the threshold.
-	sort.Slice(scoredEvents, func(i, j int) bool {
-		return scoredEvents[i].Score > scoredEvents[j].Score
-	})
-	filtered := scoredEvents[:0]
-	for _, se := range scoredEvents {
-		if se.Score >= memoryScoreThreshold {
-			filtered = append(filtered, se)
+func formatScoredMemories(query string, scores map[string]float32, limit int, gdb *db.GraphDB) (string, error) {
+	ranked := make([]scoredMemory, 0, len(scores))
+	for id, score := range scores {
+		if score >= memoryScoreThreshold {
+			ranked = append(ranked, scoredMemory{id: id, score: score})
 		}
 	}
-	scoredEvents = filtered
-
-	if limit > len(scoredEvents) {
-		limit = len(scoredEvents)
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].score == ranked[j].score {
+			return ranked[i].id < ranked[j].id
+		}
+		return ranked[i].score > ranked[j].score
+	})
+	if limit > len(ranked) {
+		limit = len(ranked)
 	}
-	topEvents := scoredEvents[:limit]
-
-	if len(topEvents) == 0 {
+	ranked = ranked[:limit]
+	if len(ranked) == 0 {
 		return "No active memories found matching the query.", nil
 	}
 
-	// Update last_accessed for the retrieved events
-	var topEventIDs []string
-	for _, se := range topEvents {
-		if id, ok := se.Event["id"].(string); ok {
-			topEventIDs = append(topEventIDs, id)
-		}
+	ids := make([]string, len(ranked))
+	for i, se := range ranked {
+		ids[i] = se.id
 	}
-	if len(topEventIDs) > 0 {
-		if err := gdb.UpdateEventAccess(nil, topEventIDs, time.Now().Unix()); err != nil {
-			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to update event access times: %v\n", err)
-		}
+	if err := gdb.UpdateEventAccess(nil, ids, time.Now().Unix()); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to update event access times: %v\n", err)
+	}
+	texts, err := gdb.GetEventTexts(ids)
+	if err != nil {
+		return "", err
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Found %d memories matching '%s':\n\n", len(topEvents), query))
-	for i, se := range topEvents {
-		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] (ID: %s, Type: %s)\n", i+1, se.Score, se.Event["id"], se.Event["event_type"]))
-		sb.WriteString(fmt.Sprintf("   Summary: %s\n", se.Event["summary"]))
-		if details, ok := se.Event["details"].(string); ok && details != "" {
-			// truncate details if too long
+	sb.WriteString(fmt.Sprintf("Found %d memories matching '%s':\n\n", len(ranked), query))
+	for i, se := range ranked {
+		ev := texts[se.id]
+		sb.WriteString(fmt.Sprintf("%d. [Score: %.3f] (ID: %s, Type: %s)\n", i+1, se.score, se.id, ev.EventType))
+		sb.WriteString(fmt.Sprintf("   Summary: %s\n", ev.Summary))
+		if ev.Details != "" {
+			details := ev.Details
 			if len(details) > 300 {
 				details = truncateString(details, 300) + "..."
 			}
@@ -179,7 +213,6 @@ func runSearchMemoryEmbedded(query string, emb []float32, limit int, projectID s
 		}
 		sb.WriteString("\n")
 	}
-
 	return sb.String(), nil
 }
 
@@ -193,7 +226,7 @@ func RunRemember(summary, details, eventType string, importance int, projectID s
 
 	// Embed summary and details combined
 	embedText := fmt.Sprintf("[%s] %s\n%s", eventType, summary, details)
-	emb, _, err := vector.GetEmbedding(
+	emb, src, err := vector.GetEmbedding(
 		embedText,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -204,10 +237,11 @@ func RunRemember(summary, details, eventType string, importance int, projectID s
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to embed memory: %v. Falling back to pseudo-embedding.\n", err)
 		emb = vector.GeneratePseudoEmbedding(embedText, cfg.Embedding.Dimension)
+		src = vector.EmbeddingSourcePseudo
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
-	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active", importance, projectID)
+	err = gdb.SaveEvent(nil, id, eventType, summary, details, timestamp, embBytes, "active", importance, projectID, string(src))
 	if err != nil {
 		return fmt.Errorf("failed to save memory to DB: %w", err)
 	}
@@ -258,10 +292,11 @@ func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summ
 
 		// Create vector embedding for the transcript summary
 		embText := summary + "\n" + transcript
-		emb, _, err := vector.GetEmbedding(embText, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey, cfg.Embedding.Dimension)
+		emb, src, err := vector.GetEmbedding(embText, cfg.Embedding.Provider, cfg.Embedding.Model, cfg.Embedding.Endpoint, cfg.Embedding.APIKey, cfg.Embedding.Dimension)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to generate embedding for conversation: %v. Falling back to pseudo-embedding.\n", err)
 			emb = vector.GeneratePseudoEmbedding(embText, cfg.Embedding.Dimension)
+			src = vector.EmbeddingSourcePseudo
 		}
 		var embBytes []byte
 		if emb != nil {
@@ -269,7 +304,7 @@ func RunIngestConversation(gdb *db.GraphDB, cfg *config.Config, transcript, summ
 		}
 
 		// Save as an event with type 'conversation', importance 2 (default cold layer)
-		err = gdb.SaveEvent(tx, id, "conversation", summary, details, now, embBytes, "archived", 2, projectID)
+		err = gdb.SaveEvent(tx, id, "conversation", summary, details, now, embBytes, "archived", 2, projectID, string(src))
 		if err != nil {
 			return err
 		}
@@ -475,7 +510,7 @@ func RunSynthesizeMemories(eventIDs []string, summary, synthesis, projectID stri
 	importance := 8 // High importance for synthesized knowledge
 
 	embedText := fmt.Sprintf("[%s] %s\n%s", eventType, summary, synthesis)
-	emb, _, err := vector.GetEmbedding(
+	emb, src, err := vector.GetEmbedding(
 		embedText,
 		cfg.Embedding.Provider,
 		cfg.Embedding.Model,
@@ -486,10 +521,11 @@ func RunSynthesizeMemories(eventIDs []string, summary, synthesis, projectID stri
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[MCP] Warning: Failed to embed synthesis: %v. Falling back to pseudo-embedding.\n", err)
 		emb = vector.GeneratePseudoEmbedding(embedText, cfg.Embedding.Dimension)
+		src = vector.EmbeddingSourcePseudo
 	}
 
 	embBytes := vector.Float32SliceToBytes(emb)
-	err = gdb.SaveEvent(nil, id, eventType, summary, synthesis, timestamp, embBytes, "active", importance, projectID)
+	err = gdb.SaveEvent(nil, id, eventType, summary, synthesis, timestamp, embBytes, "active", importance, projectID, string(src))
 	if err != nil {
 		return "", fmt.Errorf("failed to save synthesized memory to DB: %w", err)
 	}
